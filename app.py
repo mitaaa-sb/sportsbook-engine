@@ -295,7 +295,7 @@ def calculate_historical_lambdas(
     Returns (lam_home, lam_away, home_info, away_info, league_home_avg, league_away_avg).
     home_info/away_info now also carry "attack"/"defense" ratios (relative to
     1.00 league average) alongside the raw goals — these are exactly the α/β
-    values shown in the Manual Rating Override panel, and the league_home_avg/
+    values shown in the Team Rating Engine Controls panel, and the league_home_avg/
     league_away_avg returned here are the SAME baseline used to compute them,
     so an override can be recombined with `league_avg * attack * defense`
     and get an answer consistent with the auto-computed one."""
@@ -714,7 +714,7 @@ def calculate_team_base_lambdas(
     """Fallback lambda calculator from single-season standings data.
     Returns the same shape as calculate_historical_lambdas — (lam_home,
     lam_away, home_info, away_info, league_home_avg, league_away_avg) — so
-    the Manual Rating Override panel works identically regardless of which
+    the Team Rating Engine Controls panel works identically regardless of which
     data source actually produced the auto values."""
     league_home_avg = max(team_stats['home_xG_for'].mean(), 1.0)
     league_away_avg = max(team_stats['away_xG_for'].mean(), 1.0)
@@ -989,46 +989,67 @@ else:
     )
     lambda_source = "live standings" if FOOTBALL_DATA_KEY else "mock season stats"
 
-# --- Manual Rating Override panel ---
-# Ports the "editable team rating sheet" idea from the quant-trader prompt
-# into the deterministic pipeline: pre-fills each team's AUTO-computed
-# attack/defense/xG (whatever source produced them above), lets you override
-# any of them, and recombines using the EXACT SAME formula the auto pipeline
-# uses (league_avg × attack × defense) — so an edit here stays consistent
-# with how every other match is priced, rather than becoming a disconnected
-# guess. Deliberately does NOT call an LLM to estimate these; that would
-# reintroduce the same hallucination risk we spent several rounds removing.
+# --- Team Rating Engine Controls (Automated / Custom Manual Override) ---
+# Adopts the radio-toggle UX and metric-column layout from the reference
+# snippet, but keeps OUR backend: alias-matched team lookup, per-league
+# dynamic baselines (league_home_avg_used/league_away_avg_used), and
+# auto-detected promotion handling via home_tier_info/away_tier_info — none
+# of that gets replaced. Deliberately does NOT call an LLM to estimate a
+# rating when data is missing; the neutral 1.0/1.0 fallback already in
+# home_tier_info/away_tier_info says "we don't know" honestly rather than
+# injecting an unsourced home-favorite prior.
 st.sidebar.divider()
-st.sidebar.subheader("⚙️ Manual Rating Override")
-st.sidebar.caption("Pre-filled with the auto-computed values below. Override only if you have a reason the pipeline can't see yet — e.g. a transfer, a manager change, or a club with no usable historical match.")
+st.sidebar.subheader("⚙️ Team Rating Engine Controls")
 
-def _rating_override_ui(team_name: str, info: dict, key_prefix: str):
-    with st.sidebar.expander(f"{team_name} — {info['tier']}"):
-        override_on = st.checkbox(f"Override {team_name}'s rating", value=False, key=f"{key_prefix}_override_on")
-        attack_eff = st.number_input(
-            "Attack Rating (α, vs 1.00 league avg)", value=float(info["attack"]), step=0.01,
-            key=f"{key_prefix}_attack", disabled=not override_on,
-        )
-        defense_eff = st.number_input(
-            "Defense Rating (β, vs 1.00 league avg)", value=float(info["defense"]), step=0.01,
-            key=f"{key_prefix}_defense", disabled=not override_on,
-        )
-        overall = round(min(max(50 + (attack_eff - defense_eff) * 25, 0), 100), 1)
-        st.caption(f"Overall Power Rating (derived, read-only): **{overall}/100**")
-        gf = info.get("goals_for")
-        ga = info.get("goals_against")
-        st.caption(f"Auto xG profile — For: {gf:.2f} / Against: {ga:.2f}" if gf is not None and ga is not None
-                   else "Auto xG profile — unavailable for this team")
-        return override_on, attack_eff, defense_eff
+rating_mode = st.sidebar.radio(
+    "Rating Mode",
+    options=["Automated (Data-Driven)", "Custom Manual Override"],
+    index=0,
+    help="Automated uses whichever source produced the values above (historical CSV, live standings, or a labeled fallback). Custom lets you type in your own attack/defense ratings, pre-filled with the automated numbers as a starting point.",
+)
 
-home_override_on, home_attack_eff, home_defense_eff = _rating_override_ui(home_team, home_tier_info, "home")
-away_override_on, away_attack_eff, away_defense_eff = _rating_override_ui(away_team, away_tier_info, "away")
+def _overall_rating(attack: float, defense: float) -> float:
+    return round(min(max(50 + (attack - defense) * 25, 0), 100), 1)
 
-if home_override_on or away_override_on:
+st.sidebar.caption(
+    f"{home_team}: {home_tier_info['tier']}" + (f" ({home_tier_info['n']} matches)" if home_tier_info.get('n') else "")
+    + f" · {away_team}: {away_tier_info['tier']}" + (f" ({away_tier_info['n']} matches)" if away_tier_info.get('n') else "")
+)
+
+if rating_mode == "Automated (Data-Driven)":
+    st.sidebar.success("🟢 Ratings auto-synced from the data source above")
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        st.metric(f"{home_team} α (Att)", home_tier_info["attack"])
+        st.metric(f"{home_team} β (Def)", home_tier_info["defense"])
+        st.metric(f"{home_team} Overall", f"{_overall_rating(home_tier_info['attack'], home_tier_info['defense'])}/100")
+    with col2:
+        st.metric(f"{away_team} α (Att)", away_tier_info["attack"])
+        st.metric(f"{away_team} β (Def)", away_tier_info["defense"])
+        st.metric(f"{away_team} Overall", f"{_overall_rating(away_tier_info['attack'], away_tier_info['defense'])}/100")
+
+    home_attack_eff, home_defense_eff = home_tier_info["attack"], home_tier_info["defense"]
+    away_attack_eff, away_defense_eff = away_tier_info["attack"], away_tier_info["defense"]
+    ratings_overridden = False
+else:
+    st.sidebar.warning("✏️ Custom override active — recombined using the same league_avg × attack × defense formula as automated mode")
+    c1, c2 = st.sidebar.columns(2)
+    with c1:
+        st.markdown(f"**{home_team}**")
+        home_attack_eff = st.number_input("Attack (α)", 0.10, 3.00, value=float(home_tier_info["attack"]), step=0.05, key="home_attack_custom")
+        home_defense_eff = st.number_input("Defense (β)", 0.10, 3.00, value=float(home_tier_info["defense"]), step=0.05, key="home_defense_custom")
+        st.caption(f"Overall: **{_overall_rating(home_attack_eff, home_defense_eff)}/100**")
+    with c2:
+        st.markdown(f"**{away_team}**")
+        away_attack_eff = st.number_input("Attack (α)", 0.10, 3.00, value=float(away_tier_info["attack"]), step=0.05, key="away_attack_custom")
+        away_defense_eff = st.number_input("Defense (β)", 0.10, 3.00, value=float(away_tier_info["defense"]), step=0.05, key="away_defense_custom")
+        st.caption(f"Overall: **{_overall_rating(away_attack_eff, away_defense_eff)}/100**")
+    ratings_overridden = True
+
+if ratings_overridden:
     base_lam_home = round(league_home_avg_used * home_attack_eff * away_defense_eff, 3)
     base_lam_away = round(league_away_avg_used * away_attack_eff * home_defense_eff, 3)
-    overridden = ", ".join(t for t, on in [(home_team, home_override_on), (away_team, away_override_on)] if on)
-    lambda_source += f" + manual override ({overridden})"
+    lambda_source += " + custom manual override"
 
 home_form_df = fetch_team_form(home_team, league)
 away_form_df = fetch_team_form(away_team, league)
