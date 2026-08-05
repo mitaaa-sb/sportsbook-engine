@@ -74,10 +74,26 @@ HIST_SECONDARY_LEAGUE_MAP = {
     "F1": "F2",    # Ligue 1 <- Ligue 2
 }
 
+# Display names for the second tier, used only in the Rating Calculation
+# Breakdown UI so the transparency table reads "Championship Baseline"
+# rather than the raw football-data.co.uk code "E1 Baseline".
+SECOND_TIER_DISPLAY_NAMES = {
+    "E1": "Championship",
+    "SP2": "Segunda División",
+    "I2": "Serie B",
+    "D2": "2. Bundesliga",
+    "F2": "Ligue 2",
+}
+
 # Rough, commonly-cited heuristic adjustments for a newly promoted club:
 # they tend to score less and concede more once they step up a division
 # compared to their previous tier's numbers. These are NOT fitted to this
 # dataset — treat them as a reasonable prior, not a calibrated estimate.
+# (Note: a reference snippet floating around uses 0.55/1.48 instead — a much
+# harsher penalty with the same unearned precision. Neither number is backed
+# by anything more rigorous than "commonly cited"; if you want this properly
+# calibrated, it should be backtested against actual promoted teams' first-
+# season top-flight numbers vs. their prior second-tier numbers.)
 PROMOTION_ATTACK_DISCOUNT = 0.85
 PROMOTION_DEFENSE_PENALTY = 1.15
 
@@ -203,6 +219,7 @@ HIST_TEAM_ALIASES = {
     "AS Saint-Etienne": "St Etienne",
     "Olympique Marseille": "Marseille",
     "Olympique Lyonnais": "Lyon",
+    "Coventry City": "Coventry",
 }
 
 
@@ -232,10 +249,16 @@ def _match_hist_team_rows(hist_df: pd.DataFrame, column: str, team_name: str) ->
     "Real Sociedad", and "Real Betis" all start with "Real ".
 
     This now: (1) normalizes/aliases the name first, (2) tries an exact
-    (case-insensitive) match, and (3) only falls back to a substring match if
-    it resolves to a SINGLE unique team — it never silently blends two clubs'
-    results together, and returns empty (safe fallback to league-average)
-    rather than a guess when the match is ambiguous or absent.
+    (case-insensitive) match, (3) falls back to a substring match in EITHER
+    direction — the official name inside the CSV name (e.g. "Tottenham" in
+    "Tottenham Hotspur"), or the CSV's shorter name inside the official one
+    (e.g. "Coventry" inside "Coventry City" — the direction the original
+    version of this function was missing, which is why Coventry City fell
+    all the way through to the neutral 1.0/1.0 fallback instead of using
+    their real Championship record) — but ONLY if it resolves to a SINGLE
+    unique team either way. It never silently blends two clubs' results
+    together, and returns empty (safe fallback to league-average) rather
+    than a guess when the match is ambiguous or absent in both directions.
     """
     target = _normalize_hist_team_name(team_name)
     if not target:
@@ -246,15 +269,21 @@ def _match_hist_team_rows(hist_df: pd.DataFrame, column: str, team_name: str) ->
         return exact
 
     candidates = hist_df[column].dropna().unique()
-    substring_hits = [c for c in candidates if target.casefold() in c.casefold()]
-    if len(substring_hits) == 1:
-        return hist_df[hist_df[column] == substring_hits[0]]
+
+    forward_hits = [c for c in candidates if target.casefold() in c.casefold()]
+    if len(forward_hits) == 1:
+        return hist_df[hist_df[column] == forward_hits[0]]
+
+    reverse_hits = [c for c in candidates if c.casefold() in target.casefold()]
+    if len(reverse_hits) == 1:
+        return hist_df[hist_df[column] == reverse_hits[0]]
 
     return hist_df.iloc[0:0]
 
 
 def _team_hist_side_stats(team_name: str, side: str, primary_df: pd.DataFrame,
-                           secondary_df: Optional[pd.DataFrame]) -> dict:
+                           secondary_df: Optional[pd.DataFrame],
+                           league_home_avg_g: float, league_away_avg_g: float) -> dict:
     """
     A team's goals-for / goals-against averages for a given side ('home' or
     'away'), trying the top-flight dataset first. If the team has ZERO
@@ -262,29 +291,52 @@ def _team_hist_side_stats(team_name: str, side: str, primary_df: pd.DataFrame,
     history yet), falls back to the second-tier dataset with a promotion
     adjustment — NOT a naming-mismatch case, a genuinely different source.
     Only truly defaults to a neutral 1.0-equivalent if found in neither.
+
+    When the second-tier fallback is used, this also returns the RAW
+    (pre-adjustment) attack/defense ratios relative to the second-tier's OWN
+    average — e.g. Coventry's rating relative to the Championship average,
+    before any cross-tier translation — so the UI can show both stages of
+    the calculation transparently instead of only the final blended number.
     """
     team_col = 'HomeTeam' if side == 'home' else 'AwayTeam'
     for_col = 'FTHG' if side == 'home' else 'FTAG'
     against_col = 'FTAG' if side == 'home' else 'FTHG'
+    # Same column -> league-average mapping used consistently for both the
+    # primary and secondary dataset, so "attack"/"defense" always mean
+    # "this column's rate, relative to this column's league average" no
+    # matter which tier of data actually produced the raw goals.
+    primary_avg_for = league_home_avg_g if for_col == 'FTHG' else league_away_avg_g
+    primary_avg_against = league_home_avg_g if against_col == 'FTHG' else league_away_avg_g
 
     matches = _match_hist_team_rows(primary_df, team_col, team_name).head(38)
     if not matches.empty:
+        gf, ga = float(matches[for_col].mean()), float(matches[against_col].mean())
         return {
-            "goals_for": float(matches[for_col].mean()),
-            "goals_against": float(matches[against_col].mean()),
+            "goals_for": gf, "goals_against": ga,
+            "attack": round(gf / primary_avg_for, 3), "defense": round(ga / primary_avg_against, 3),
             "tier": "top-flight", "n": len(matches),
+            "raw_attack": None, "raw_defense": None, "raw_goals_for": None, "raw_goals_against": None,
         }
 
     if secondary_df is not None and not secondary_df.empty:
         sec_matches = _match_hist_team_rows(secondary_df, team_col, team_name).head(38)
         if not sec_matches.empty:
+            sec_avg_for = max(secondary_df[for_col].mean(), 1.0)
+            sec_avg_against = max(secondary_df[against_col].mean(), 1.0)
+            raw_gf, raw_ga = float(sec_matches[for_col].mean()), float(sec_matches[against_col].mean())
+            adj_gf = raw_gf * PROMOTION_ATTACK_DISCOUNT
+            adj_ga = raw_ga * PROMOTION_DEFENSE_PENALTY
             return {
-                "goals_for": float(sec_matches[for_col].mean()) * PROMOTION_ATTACK_DISCOUNT,
-                "goals_against": float(sec_matches[against_col].mean()) * PROMOTION_DEFENSE_PENALTY,
+                "goals_for": adj_gf, "goals_against": adj_ga,
+                "attack": round(adj_gf / primary_avg_for, 3), "defense": round(adj_ga / primary_avg_against, 3),
                 "tier": "second-tier (promotion-adjusted)", "n": len(sec_matches),
+                "raw_attack": round(raw_gf / sec_avg_for, 3), "raw_defense": round(raw_ga / sec_avg_against, 3),
+                "raw_goals_for": round(raw_gf, 3), "raw_goals_against": round(raw_ga, 3),
             }
 
-    return {"goals_for": None, "goals_against": None, "tier": "no match — league average", "n": 0}
+    return {"goals_for": None, "goals_against": None, "attack": 1.0, "defense": 1.0,
+            "tier": "no match — league average", "n": 0,
+            "raw_attack": None, "raw_defense": None, "raw_goals_for": None, "raw_goals_against": None}
 
 
 def calculate_historical_lambdas(
@@ -299,21 +351,17 @@ def calculate_historical_lambdas(
     league_away_avg returned here are the SAME baseline used to compute them,
     so an override can be recombined with `league_avg * attack * defense`
     and get an answer consistent with the auto-computed one."""
+    empty_keys = {"attack": 1.0, "defense": 1.0, "raw_attack": None, "raw_defense": None,
+                  "raw_goals_for": None, "raw_goals_against": None, "goals_for": None, "goals_against": None}
     if hist_df.empty:
-        empty_info = {"goals_for": None, "goals_against": None, "attack": 1.0, "defense": 1.0,
-                       "tier": "no historical data", "n": 0}
+        empty_info = {**empty_keys, "tier": "no historical data", "n": 0}
         return 1.55, 1.20, empty_info, empty_info, 1.55, 1.20
 
     league_home_avg_g = max(hist_df['FTHG'].mean(), 1.0)
     league_away_avg_g = max(hist_df['FTAG'].mean(), 1.0)
 
-    home_info = _team_hist_side_stats(home_team, 'home', hist_df, secondary_df)
-    away_info = _team_hist_side_stats(away_team, 'away', hist_df, secondary_df)
-
-    home_info["attack"] = round((home_info["goals_for"] / league_home_avg_g) if home_info["goals_for"] is not None else 1.0, 3)
-    home_info["defense"] = round((home_info["goals_against"] / league_away_avg_g) if home_info["goals_against"] is not None else 1.0, 3)
-    away_info["attack"] = round((away_info["goals_for"] / league_away_avg_g) if away_info["goals_for"] is not None else 1.0, 3)
-    away_info["defense"] = round((away_info["goals_against"] / league_home_avg_g) if away_info["goals_against"] is not None else 1.0, 3)
+    home_info = _team_hist_side_stats(home_team, 'home', hist_df, secondary_df, league_home_avg_g, league_away_avg_g)
+    away_info = _team_hist_side_stats(away_team, 'away', hist_df, secondary_df, league_home_avg_g, league_away_avg_g)
 
     lam_home = league_home_avg_g * home_info["attack"] * away_info["defense"]
     lam_away = league_away_avg_g * away_info["attack"] * home_info["defense"]
@@ -550,8 +598,90 @@ def fetch_player_recent_ratings(team_id: int, n_games: int = 5) -> dict:
         return {}
 
 
+def _parse_players_stats_page(response_items: list, pos_map: dict, recent_ratings: dict,
+                               fallback_xg90: dict, fallback_xa90: dict) -> list:
+    """Turns one page of API-Football /players response items into squad rows.
+    Shared by both the current-season and previous-season attempts below so
+    the parsing logic only exists once."""
+    rows = []
+    for p in response_items:
+        info = p.get("player", {})
+        stat = (p.get("statistics") or [{}])[0]
+        games = stat.get("games", {}) or {}
+        goals = stat.get("goals", {}) or {}
+        minutes = games.get("minutes") or 0
+        pos = pos_map.get(games.get("position"), "MF")
+        goals_total = goals.get("total") or 0
+        assists_total = goals.get("assists") or 0
+        name = info.get("name")
+
+        recent = recent_ratings.get(name)
+        if recent:
+            rating, games_rated = recent["avg_rating"], recent["games_rated"]
+        else:
+            season_rating_raw = games.get("rating")
+            rating = round(float(season_rating_raw), 2) if season_rating_raw else 6.8
+            games_rated = 0
+
+        if minutes and minutes > 0:
+            xg90 = round(goals_total / minutes * 90, 3)
+            xa90 = round(assists_total / minutes * 90, 3)
+        else:
+            xg90 = fallback_xg90.get(pos, 0.08)
+            xa90 = fallback_xa90.get(pos, 0.05)
+
+        rows.append({
+            "player": name, "position": pos, "minutes": minutes,
+            "xG90": xg90, "xA90": xa90,
+            "key_passes90": round(assists_total / max(minutes, 1) * 90 * 1.8, 2),
+            "avg_rating": rating, "games_rated": games_rated, "status": "Active",
+        })
+    return rows
+
+
+def _fetch_players_stats_all_pages(team_id: int, season: int, headers: dict) -> list:
+    """Pages through API-Football's /players endpoint for one team+season,
+    capped at 3 pages to respect free-tier rate limits. Returns the raw
+    response items (not yet parsed into rows) so the caller can decide
+    whether the season actually had any data before committing to it."""
+    items, page, total_pages = [], 1, 1
+    while page <= total_pages and page <= 3:
+        r_stats = requests.get(
+            f"https://{API_FOOTBALL_HOST}/players",
+            headers=headers, params={"team": team_id, "season": season, "page": page}, timeout=8,
+        )
+        r_stats.raise_for_status()
+        payload = r_stats.json()
+        total_pages = payload.get("paging", {}).get("total", 1)
+        items.extend(payload.get("response", []))
+        page += 1
+    return items
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_squad(team_name: str, seed_offset: int = 0, n_games: int = 5) -> pd.DataFrame:
+    """
+    BUGFIX: this previously made ONE call to /players?season=<current> and,
+    if it came back empty, silently fell all the way to the fake-name mock
+    squad. That endpoint is stats-driven — it only returns players who've
+    accumulated match stats for that team in that specific season — so it
+    returns empty for EVERY club during preseason (no matches played yet in
+    the new season) or for a newly promoted club with zero top-flight
+    appearances this season. Both are real, common situations, not edge
+    cases, and the old code treated them identically to "API key invalid."
+
+    Now tries three tiers before giving up, in order:
+      1. Current season's real per-player stats (best case).
+      2. Previous season's real per-player stats, if the current season has
+         no data yet (preseason, or newly promoted with zero stats so far)
+         — same players, still-useful per-90 rates, just one season stale.
+      3. The roster-only /players/squads endpoint (names + positions,
+         no season dependency at all) with position-average fallback rates,
+         if even the previous season came back empty.
+    Only falls to the fully-synthetic mock squad if the team can't be found
+    at all. Every returned DataFrame carries a "data_source" column so the
+    UI can show which tier actually produced it — no more silent fallback.
+    """
     if API_FOOTBALL_KEY:
         try:
             headers = {"x-apisports-key": API_FOOTBALL_KEY}
@@ -570,74 +700,55 @@ def fetch_squad(team_name: str, seed_offset: int = 0, n_games: int = 5) -> pd.Da
                 fallback_xg90 = {"FW": 0.30, "MF": 0.10, "DF": 0.02, "GK": 0.0}
                 fallback_xa90 = {"FW": 0.15, "MF": 0.16, "DF": 0.03, "GK": 0.0}
 
-                # Recent per-match ratings — this is what drives "in form"
-                # rather than the season-long aggregate below.
+                # Recent per-match ratings come from /fixtures?last=N, which
+                # has no "season" parameter — it just returns the last N
+                # played matches regardless of season boundary, so this
+                # tier keeps working correctly through the preseason gap.
                 recent_ratings = fetch_player_recent_ratings(team_id, n_games)
 
-                rows, page, total_pages = [], 1, 1
-                while page <= total_pages and page <= 3:
-                    r_stats = requests.get(
-                        f"https://{API_FOOTBALL_HOST}/players",
-                        headers=headers, params={"team": team_id, "season": season, "page": page}, timeout=8,
+                # --- Tier 1: current season stats ---
+                items = _fetch_players_stats_all_pages(team_id, season, headers)
+                data_source = f"API-Football player stats ({season} season)"
+
+                # --- Tier 2: previous season stats, if current is empty ---
+                if not items:
+                    items = _fetch_players_stats_all_pages(team_id, season - 1, headers)
+                    data_source = f"API-Football player stats ({season - 1} season — {season} not yet underway)"
+
+                rows = _parse_players_stats_page(items, pos_map, recent_ratings, fallback_xg90, fallback_xa90)
+
+                # --- Tier 3: roster-only endpoint, if both seasons are empty ---
+                if not rows:
+                    r_squad = requests.get(
+                        f"https://{API_FOOTBALL_HOST}/players/squads",
+                        headers=headers, params={"team": team_id}, timeout=8,
                     )
-                    r_stats.raise_for_status()
-                    payload = r_stats.json()
-                    total_pages = payload.get("paging", {}).get("total", 1)
-
-                    for p in payload.get("response", []):
-                        info = p.get("player", {})
-                        stat = (p.get("statistics") or [{}])[0]
-                        games = stat.get("games", {}) or {}
-                        goals = stat.get("goals", {}) or {}
-                        minutes = games.get("minutes") or 0
-                        pos = pos_map.get(games.get("position"), "MF")
-                        goals_total = goals.get("total") or 0
-                        assists_total = goals.get("assists") or 0
-                        name = info.get("name")
-
-                        # BUGFIX / FEATURE: avg_rating used to be API-Football's
-                        # season-to-date aggregate rating, which tells you
-                        # nothing about recent form (a great start to the
-                        # season masks three recent poor games, and vice
-                        # versa). Now it's the average of this player's ACTUAL
-                        # ratings across the team's last n_games matches, with
-                        # games_rated showing the real sample size behind that
-                        # number — 0 means dropped from the side recently.
-                        recent = recent_ratings.get(name)
-                        if recent:
-                            rating = recent["avg_rating"]
-                            games_rated = recent["games_rated"]
-                        else:
-                            season_rating_raw = games.get("rating")
-                            rating = round(float(season_rating_raw), 2) if season_rating_raw else 6.8
-                            games_rated = 0
-
-                        if minutes and minutes > 0:
-                            xg90 = round(goals_total / minutes * 90, 3)
-                            xa90 = round(assists_total / minutes * 90, 3)
-                        else:
-                            xg90 = fallback_xg90.get(pos, 0.08)
-                            xa90 = fallback_xa90.get(pos, 0.05)
-
-                        rows.append({
-                            "player": name,
-                            "position": pos,
-                            "minutes": minutes,
-                            "xG90": xg90,
-                            "xA90": xa90,
-                            "key_passes90": round(assists_total / max(minutes, 1) * 90 * 1.8, 2),
-                            "avg_rating": rating,
-                            "games_rated": games_rated,
-                            "status": "Active",
-                        })
-                    page += 1
+                    r_squad.raise_for_status()
+                    squad_res = r_squad.json().get("response", [])
+                    if squad_res and "players" in squad_res[0]:
+                        data_source = "API-Football roster (no season stats available yet)"
+                        for p in squad_res[0]["players"]:
+                            pos = pos_map.get(p.get("position"), "MF")
+                            name = p.get("name")
+                            recent = recent_ratings.get(name)
+                            rating, games_rated = (recent["avg_rating"], recent["games_rated"]) if recent else (6.8, 0)
+                            rows.append({
+                                "player": name, "position": pos, "minutes": 0,
+                                "xG90": fallback_xg90.get(pos, 0.08), "xA90": fallback_xa90.get(pos, 0.05),
+                                "key_passes90": 0.5 if pos == "MF" else 0.3,
+                                "avg_rating": rating, "games_rated": games_rated, "status": "Active",
+                            })
 
                 if rows:
-                    return pd.DataFrame(rows)
+                    df = pd.DataFrame(rows)
+                    df["data_source"] = data_source
+                    return df
         except Exception:
             pass
 
-    return _mock_squad(team_name, seed_offset, n_games)
+    df = _mock_squad(team_name, seed_offset, n_games)
+    df["data_source"] = "Mock (API-Football unavailable or team not found)"
+    return df
 
 
 
@@ -744,12 +855,14 @@ def calculate_team_base_lambdas(
         "goals_against": float(h_stat['home_xG_against'].values[0]) if not h_stat.empty else None,
         "attack": round(float(home_att), 3), "defense": round(float(home_def), 3),
         "tier": "live standings" if not h_stat.empty else "no match — league average", "n": None,
+        "raw_attack": None, "raw_defense": None, "raw_goals_for": None, "raw_goals_against": None,
     }
     away_info = {
         "goals_for": float(a_stat['away_xG_for'].values[0]) if not a_stat.empty else None,
         "goals_against": float(a_stat['away_xG_against'].values[0]) if not a_stat.empty else None,
         "attack": round(float(away_att), 3), "defense": round(float(away_def), 3),
         "tier": "live standings" if not a_stat.empty else "no match — league average", "n": None,
+        "raw_attack": None, "raw_defense": None, "raw_goals_for": None, "raw_goals_against": None,
     }
     
     return (round(base_lam_home, 3), round(base_lam_away, 3), home_info, away_info,
@@ -1124,12 +1237,100 @@ with c4:
     st.metric("🌡️ Temp", f"{weather['temperature_c']}°C")
     st.metric("💨 Wind", f"{weather['wind_speed_kmh']} km/h")
 
+# ---- Rating Calculation Breakdown ----
+# A transparent, formula-level view of how α/β and λ were actually derived —
+# every number here is one we computed above, not re-estimated for display.
+with st.expander("📊 Rating Calculation Breakdown"):
+    primary_league_name = league
+    secondary_league_name = SECOND_TIER_DISPLAY_NAMES.get(secondary_code, secondary_code or "n/a")
+
+    summary_rows = []
+    for team_name, info in ((home_team, home_tier_info), (away_team, away_tier_info)):
+        if info["tier"] == "second-tier (promotion-adjusted)":
+            summary_rows.append({
+                "Team": team_name, "League Context": f"{secondary_league_name} Baseline",
+                "Attack Rating (α)": info["raw_attack"], "Defense Rating (β)": info["raw_defense"],
+            })
+            summary_rows.append({
+                "Team": team_name, "League Context": f"{primary_league_name} Adjusted",
+                "Attack Rating (α)": info["attack"], "Defense Rating (β)": info["defense"],
+            })
+        elif info["tier"] == "top-flight":
+            summary_rows.append({
+                "Team": team_name, "League Context": f"{primary_league_name} Baseline",
+                "Attack Rating (α)": info["attack"], "Defense Rating (β)": info["defense"],
+            })
+        else:
+            summary_rows.append({
+                "Team": team_name, "League Context": f"League Average ({info['tier']})",
+                "Attack Rating (α)": info["attack"], "Defense Rating (β)": info["defense"],
+            })
+
+    st.markdown("**Rating Summary Table**")
+    st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
+
+    st.markdown("**Key Metric Explanations**")
+    for team_name, info in ((home_team, home_tier_info), (away_team, away_tier_info)):
+        if info["tier"] == "second-tier (promotion-adjusted)":
+            att_pct = round((info["raw_attack"] - 1) * 100, 1)
+            def_pct = round((1 - info["raw_defense"]) * 100, 1)
+            st.markdown(
+                f"- **{team_name} ({secondary_league_name} raw)** — Attack (α={info['raw_attack']}): "
+                f"{'generates ' + str(abs(att_pct)) + '% more' if att_pct >= 0 else 'generates ' + str(abs(att_pct)) + '% less'} "
+                f"xG than a standard {secondary_league_name} team. "
+                f"Defense (β={info['raw_defense']}): concedes "
+                f"{'fewer' if def_pct >= 0 else 'more'} goals than average ({abs(def_pct)}% {'below' if def_pct>=0 else 'above'} the {secondary_league_name} mean)."
+            )
+            st.markdown(
+                f"- **{team_name} ({primary_league_name} adjusted)** — applied cross-tier translation "
+                f"(attack ×{PROMOTION_ATTACK_DISCOUNT}, defense ×{PROMOTION_DEFENSE_PENALTY}, "
+                f"a heuristic prior, not fitted to this data): "
+                f"α = {info['raw_attack']} × {PROMOTION_ATTACK_DISCOUNT} → **{info['attack']}**, "
+                f"β = {info['raw_defense']} × {PROMOTION_DEFENSE_PENALTY} → **{info['defense']}**."
+            )
+        elif info["tier"] == "top-flight":
+            st.markdown(
+                f"- **{team_name}** — Attack (α={info['attack']}): "
+                f"{'generates' if info['attack']>=1 else 'produces'} {abs(round((info['attack']-1)*100,1))}% "
+                f"{'more' if info['attack']>=1 else 'less'} xG than a standard {primary_league_name} team. "
+                f"Defense (β={info['defense']}): concedes {abs(round((info['defense']-1)*100,1))}% "
+                f"{'less' if info['defense']<1 else 'more'} than the {primary_league_name} average "
+                f"(across {info['n']} matches)."
+            )
+        else:
+            st.markdown(f"- **{team_name}** — no usable match data in either tier; using the neutral league-average fallback (α=1.0, β=1.0).")
+
+    st.markdown("**How These Metrics Combine in the Poisson Match Model**")
+    st.markdown(
+        f"Using this fixture's actual baselines (Home Avg Goals = {league_home_avg_used}, "
+        f"Away Avg Goals = {league_away_avg_used}):"
+    )
+    st.latex(
+        rf"\lambda_H = {league_home_avg_used} \times {home_tier_info['attack']} \times {away_tier_info['defense']} "
+        rf"\approx {round(league_home_avg_used * home_tier_info['attack'] * away_tier_info['defense'], 3)}\ \text{{xG}}"
+    )
+    st.latex(
+        rf"\lambda_A = {league_away_avg_used} \times {away_tier_info['attack']} \times {home_tier_info['defense']} "
+        rf"\approx {round(league_away_avg_used * away_tier_info['attack'] * home_tier_info['defense'], 3)}\ \text{{xG}}"
+    )
+    st.caption(
+        "These are the BASE λ values (before PIV, form, weather, and rest multipliers are applied — see the "
+        "caption under the λ cards above for the fully adjusted figure). If you've applied a Custom Manual "
+        "Override above, this section still reflects the AUTOMATED numbers, so you can see what changed."
+    )
+
 st.divider()
 
 # ---- Squad & Player Form Section ----
 st.subheader("👥 Player Form & Impact Penalties")
 st.caption(f"avg_rating and games_rated reflect each player's actual performance over their last {rating_window} matches "
            f"(not season average) — games_rated = 0 means they haven't featured in that recent window.")
+home_squad_source = home_squad["data_source"].iloc[0] if "data_source" in home_squad.columns and len(home_squad) else "unknown"
+away_squad_source = away_squad["data_source"].iloc[0] if "data_source" in away_squad.columns and len(away_squad) else "unknown"
+if "Mock" in home_squad_source or "Mock" in away_squad_source:
+    st.warning(f"⚠️ Squad data source — {home_team}: **{home_squad_source}** · {away_team}: **{away_squad_source}**")
+else:
+    st.caption(f"Squad data source — {home_team}: **{home_squad_source}** · {away_team}: **{away_squad_source}**")
 pc1, pc2 = st.columns(2)
 display_cols = ["player", "position", "avg_rating", "games_rated", "xG90", "xA90", "status", "absence_penalty_%"]
 with pc1:
