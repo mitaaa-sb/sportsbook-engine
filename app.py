@@ -90,7 +90,7 @@ def _mock_fixtures(league: str) -> pd.DataFrame:
 def _mock_season_stats(league: str) -> pd.DataFrame:
     random.seed(hash(league) % 2000)
     teams = ["Arsenal", "Man City", "Liverpool", "Chelsea", "Aston Villa", "Tottenham", 
-             "Real Madrid", "Barcelona", "Atletico Madrid", "Inter", "AC Milan", "Bayern Munich", "PSG"]
+             "Real Madrid", "Barcelona", "Atletico Madrid", "Inter", "AC Milan", "Bayern Munich", "PSG", "Coventry City"]
     data = []
     for t in teams:
         data.append({
@@ -205,12 +205,63 @@ def fetch_fixtures(league_name: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_team_season_stats(league_name: str) -> pd.DataFrame:
-    # Plugs into Understat / soccerdata in production
     return _mock_season_stats(league_name)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_squad(team_name: str, seed_offset: int = 0) -> pd.DataFrame:
+    """Fetches real player rosters from API-Football if key exists, otherwise falls back to mock."""
+    if API_FOOTBALL_KEY:
+        try:
+            headers = {
+                "x-apisports-key": API_FOOTBALL_KEY
+            }
+            clean_name = team_name.replace(" FC", "").replace(" AFC", "").replace(" Football Club", "")
+            r_team = requests.get(
+                f"https://{API_FOOTBALL_HOST}/teams",
+                headers=headers,
+                params={"search": clean_name},
+                timeout=6
+            )
+            r_team.raise_for_status()
+            team_res = r_team.json().get("response", [])
+            
+            if team_res:
+                team_id = team_res[0]["team"]["id"]
+                r_squad = requests.get(
+                    f"https://{API_FOOTBALL_HOST}/players/squads",
+                    headers=headers,
+                    params={"team": team_id},
+                    timeout=6
+                )
+                r_squad.raise_for_status()
+                squad_res = r_squad.json().get("response", [])
+                
+                if squad_res and "players" in squad_res[0]:
+                    players = squad_res[0]["players"]
+                    rows = []
+                    pos_map = {"Goalkeeper": "GK", "Defender": "DF", "Midfielder": "MF", "Attacker": "FW"}
+                    
+                    for p in players:
+                        pos = pos_map.get(p.get("position"), "MF")
+                        xg90 = 0.38 if pos == "FW" else 0.14 if pos == "MF" else 0.02
+                        xa90 = 0.22 if pos in ("FW", "MF") else 0.04
+                        
+                        rows.append({
+                            "player": p.get("name"),
+                            "position": pos,
+                            "minutes": 1200,
+                            "xG90": xg90,
+                            "xA90": xa90,
+                            "key_passes90": 1.1 if pos == "MF" else 0.5,
+                            "avg_rating": 7.1,
+                            "status": "Active"
+                        })
+                    if rows:
+                        return pd.DataFrame(rows)
+        except Exception:
+            pass
+
     return _mock_squad(team_name, seed_offset)
 
 
@@ -244,7 +295,7 @@ def fetch_market_odds(home_team: str, away_team: str) -> dict:
 # ====================================================================================
 
 def calculate_team_base_lambdas(home_team: str, away_team: str, team_stats: pd.DataFrame) -> Tuple[float, float]:
-    """Calculates team-specific base xG expectations based on home/away attack & defense ratings."""
+    """Calculates team-specific base xG expectations based on relative attack and defense parameters."""
     league_home_avg = max(team_stats['home_xG_for'].mean(), 1.0)
     league_away_avg = max(team_stats['away_xG_for'].mean(), 1.0)
     
@@ -312,9 +363,9 @@ def weather_modifier(weather: dict) -> float:
 
 
 def rest_modifier(days_rest: int) -> float:
-    """Applies a penalty for short rest turnarounds (e.g. midweek matches)."""
-    if days_rest <= 2: return 0.93  # -7% lambda impact
-    elif days_rest == 3: return 0.97  # -3% lambda impact
+    """Applies a penalty for short rest turnarounds."""
+    if days_rest <= 2: return 0.93
+    elif days_rest == 3: return 0.97
     return 1.00
 
 
@@ -366,7 +417,7 @@ def apply_margin(probs: dict, target_margin_pct: float) -> dict:
 
 
 def devig_proportional(home_o: float, draw_o: float, away_o: float) -> Tuple[float, float, float]:
-    """Removes bookmaker overround to find fair market probabilities."""
+    """Removes bookmaker overround to find true fair market probabilities."""
     if not all([home_o, draw_o, away_o]) or any(o <= 1.0 for o in [home_o, draw_o, away_o]):
         return 0.0, 0.0, 0.0
     raw_h, raw_d, raw_a = 1 / home_o, 1 / draw_o, 1 / away_o
@@ -408,7 +459,7 @@ st.sidebar.title("⚽ Sportsbook Odds Engine")
 st.sidebar.caption("Quant Modeling & Devigged Edge Detection")
 
 if DEMO_MODE:
-    st.sidebar.warning("⚠️ **DEMO MODE**: Set API keys in `st.secrets` or `.env` for live feeds.")
+    st.sidebar.warning("⚠️ **DEMO MODE**: Set API keys in `st.secrets` for live feeds.")
 
 st.sidebar.subheader("API Connections")
 st.sidebar.markdown(f"{'🟢' if API_FOOTBALL_KEY else '🔴'} API-Football")
@@ -512,10 +563,10 @@ st.subheader("👥 Player Form & Impact Penalties")
 pc1, pc2 = st.columns(2)
 with pc1:
     st.markdown(f"**{home_team} Lineup & Stats**")
-    st.dataframe(home_squad[["player", "position", "avg_rating", "xG90", "xA90", "status", "absence_penalty_%"]], use_container_width=True, hide_index=True)
+    st.dataframe(home_squad[["player", "position", "avg_rating", "xG90", "xA90", "status", "absence_penalty_%"]], hide_index=True)
 with pc2:
     st.markdown(f"**{away_team} Lineup & Stats**")
-    st.dataframe(away_squad[["player", "position", "avg_rating", "xG90", "xA90", "status", "absence_penalty_%"]], use_container_width=True, hide_index=True)
+    st.dataframe(away_squad[["player", "position", "avg_rating", "xG90", "xA90", "status", "absence_penalty_%"]], hide_index=True)
 
 st.divider()
 
@@ -555,12 +606,12 @@ trade_rows = [
 ]
 
 comparison_df = pd.DataFrame(trade_rows)
-st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+st.dataframe(comparison_df, hide_index=True)
 st.caption("Edge (pp) = Model Probability − Devigged (Fair) Market Probability. Fractional Kelly sizing calculated using specified bankroll multiplier.")
 
 st.divider()
 
-# ---- Fixed Heatmap & Export ----
+# ---- Heatmap Section ----
 st.subheader("🔥 Scoreline Probability Matrix Heatmap")
 
 heat_labels = list(range(matrix.shape[0]))
@@ -583,7 +634,7 @@ fig.update_layout(
     margin=dict(l=40, r=40, t=50, b=40)
 )
 
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig)
 
 st.divider()
 st.subheader("📥 Export Analysis")
