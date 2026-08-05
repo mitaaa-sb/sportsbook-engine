@@ -61,6 +61,26 @@ HIST_LEAGUE_MAP = {
     "Ligue 1": "F1",
 }
 
+# Second-tier equivalent for each top-flight league, on football-data.co.uk's
+# own code scheme. Used ONLY as a fallback for a team with zero matches in
+# the top-flight window — i.e. a newly promoted club (e.g. Coventry City
+# going up to the Premier League for 2026/27 with no E0 history yet). This is
+# not a naming-mismatch fix; it's a genuinely different data source.
+HIST_SECONDARY_LEAGUE_MAP = {
+    "E0": "E1",    # Premier League <- Championship
+    "SP1": "SP2",  # La Liga <- Segunda División
+    "I1": "I2",    # Serie A <- Serie B
+    "D1": "D2",    # Bundesliga <- 2. Bundesliga
+    "F1": "F2",    # Ligue 1 <- Ligue 2
+}
+
+# Rough, commonly-cited heuristic adjustments for a newly promoted club:
+# they tend to score less and concede more once they step up a division
+# compared to their previous tier's numbers. These are NOT fitted to this
+# dataset — treat them as a reasonable prior, not a calibrated estimate.
+PROMOTION_ATTACK_DISCOUNT = 0.85
+PROMOTION_DEFENSE_PENALTY = 1.15
+
 _STADIUM_CITIES = {
     "Premier League": ("London", 51.5072, -0.1276),
     "La Liga": ("Madrid", 40.4168, -3.7038),
@@ -233,27 +253,66 @@ def _match_hist_team_rows(hist_df: pd.DataFrame, column: str, team_name: str) ->
     return hist_df.iloc[0:0]
 
 
-def calculate_historical_lambdas(home_team: str, away_team: str, hist_df: pd.DataFrame) -> Tuple[float, float]:
-    """Calculates team attack/defense relative strength parameters from historical data."""
+def _team_hist_side_stats(team_name: str, side: str, primary_df: pd.DataFrame,
+                           secondary_df: Optional[pd.DataFrame]) -> dict:
+    """
+    A team's goals-for / goals-against averages for a given side ('home' or
+    'away'), trying the top-flight dataset first. If the team has ZERO
+    matches there in the scanned window (e.g. newly promoted, no top-flight
+    history yet), falls back to the second-tier dataset with a promotion
+    adjustment — NOT a naming-mismatch case, a genuinely different source.
+    Only truly defaults to a neutral 1.0-equivalent if found in neither.
+    """
+    team_col = 'HomeTeam' if side == 'home' else 'AwayTeam'
+    for_col = 'FTHG' if side == 'home' else 'FTAG'
+    against_col = 'FTAG' if side == 'home' else 'FTHG'
+
+    matches = _match_hist_team_rows(primary_df, team_col, team_name).head(38)
+    if not matches.empty:
+        return {
+            "goals_for": float(matches[for_col].mean()),
+            "goals_against": float(matches[against_col].mean()),
+            "tier": "top-flight", "n": len(matches),
+        }
+
+    if secondary_df is not None and not secondary_df.empty:
+        sec_matches = _match_hist_team_rows(secondary_df, team_col, team_name).head(38)
+        if not sec_matches.empty:
+            return {
+                "goals_for": float(sec_matches[for_col].mean()) * PROMOTION_ATTACK_DISCOUNT,
+                "goals_against": float(sec_matches[against_col].mean()) * PROMOTION_DEFENSE_PENALTY,
+                "tier": "second-tier (promotion-adjusted)", "n": len(sec_matches),
+            }
+
+    return {"goals_for": None, "goals_against": None, "tier": "no match — league average", "n": 0}
+
+
+def calculate_historical_lambdas(
+    home_team: str, away_team: str, hist_df: pd.DataFrame,
+    secondary_df: Optional[pd.DataFrame] = None,
+) -> Tuple[float, float, dict, dict]:
+    """Calculates team attack/defense relative strength parameters from historical data.
+    Returns (lam_home, lam_away, home_info, away_info) — the info dicts expose
+    which tier of data actually backed each team's number, for UI diagnostics."""
     if hist_df.empty:
-        return 1.55, 1.20
+        empty_info = {"goals_for": None, "goals_against": None, "tier": "no historical data", "n": 0}
+        return 1.55, 1.20, empty_info, empty_info
 
     league_home_avg_g = max(hist_df['FTHG'].mean(), 1.0)
     league_away_avg_g = max(hist_df['FTAG'].mean(), 1.0)
 
-    home_matches = _match_hist_team_rows(hist_df, 'HomeTeam', home_team).head(38)
-    away_matches = _match_hist_team_rows(hist_df, 'AwayTeam', away_team).head(38)
+    home_info = _team_hist_side_stats(home_team, 'home', hist_df, secondary_df)
+    away_info = _team_hist_side_stats(away_team, 'away', hist_df, secondary_df)
 
-    h_att = (home_matches['FTHG'].mean() / league_home_avg_g) if not home_matches.empty else 1.0
-    h_def = (home_matches['FTAG'].mean() / league_away_avg_g) if not home_matches.empty else 1.0
-
-    a_att = (away_matches['FTAG'].mean() / league_away_avg_g) if not away_matches.empty else 1.0
-    a_def = (away_matches['FTHG'].mean() / league_home_avg_g) if not away_matches.empty else 1.0
+    h_att = (home_info["goals_for"] / league_home_avg_g) if home_info["goals_for"] is not None else 1.0
+    h_def = (home_info["goals_against"] / league_away_avg_g) if home_info["goals_against"] is not None else 1.0
+    a_att = (away_info["goals_for"] / league_away_avg_g) if away_info["goals_for"] is not None else 1.0
+    a_def = (away_info["goals_against"] / league_home_avg_g) if away_info["goals_against"] is not None else 1.0
 
     lam_home = league_home_avg_g * h_att * a_def
     lam_away = league_away_avg_g * a_att * h_def
 
-    return round(float(lam_home), 3), round(float(lam_away), 3)
+    return round(float(lam_home), 3), round(float(lam_away), 3), home_info, away_info
 
 
 # ====================================================================================
@@ -879,17 +938,19 @@ w_mult = weather_modifier(weather)
 # Dual-layer Lambda Computation: Prefer multi-season historical CSV dataset, fallback to standings
 hist_code = HIST_LEAGUE_MAP.get(league, "E0")
 hist_df = fetch_historical_league_data(hist_code)
+secondary_code = HIST_SECONDARY_LEAGUE_MAP.get(hist_code)
+secondary_hist_df = fetch_historical_league_data(secondary_code) if secondary_code else pd.DataFrame()
 
 # Diagnostics so a repeat of the mmz4235/mmz4281 URL bug — where the historical
 # engine failed 100% silently for weeks — can never hide again. Shown in the UI below.
 lambda_source = "mock"
-home_hist_matches = away_hist_matches = 0
+home_tier_info = away_tier_info = {"tier": "n/a", "n": 0}
 
 if not hist_df.empty:
     lambda_source = f"historical CSV ({len(hist_df)} matches, {hist_code})"
-    base_lam_home, base_lam_away = calculate_historical_lambdas(home_team, away_team, hist_df)
-    home_hist_matches = len(_match_hist_team_rows(hist_df, 'HomeTeam', home_team))
-    away_hist_matches = len(_match_hist_team_rows(hist_df, 'AwayTeam', away_team))
+    base_lam_home, base_lam_away, home_tier_info, away_tier_info = calculate_historical_lambdas(
+        home_team, away_team, hist_df, secondary_hist_df
+    )
 else:
     season_stats = fetch_team_season_stats(league)
     base_lam_home, base_lam_away = calculate_team_base_lambdas(home_team, away_team, season_stats)
@@ -928,17 +989,31 @@ model_odds_btts = apply_margin({"btts_yes": model_probs["btts_yes"], "btts_no": 
 st.title(f"{home_team} vs {away_team}")
 st.caption(f"{league} · Kickoff {kickoff.strftime('%A %d %B, %H:%M')} · Venue: {city}")
 
-if "historical CSV" in lambda_source and (home_hist_matches == 0 or away_hist_matches == 0):
-    st.warning(
-        f"⚠️ Historical data loaded ({len(hist_df)} matches) but couldn't confidently match "
-        f"{home_team if home_hist_matches == 0 else away_team} by name — that team's λ is using "
-        f"the 1.0 league-average fallback rather than its real record. Consider adding an alias "
-        f"to `HIST_TEAM_ALIASES` for this club."
-    )
-st.caption(f"λ base source: **{lambda_source}**" + (
-    f" · matched {home_hist_matches} {home_team} / {away_hist_matches} {away_team} rows"
-    if "historical CSV" in lambda_source else ""
-))
+def _tier_warning(team_name: str, info: dict) -> Optional[str]:
+    if info["tier"] == "second-tier (promotion-adjusted)":
+        return (f"ℹ️ {team_name} has no top-flight matches in the scanned window (likely newly promoted) — "
+                f"using their last {info['n']} second-tier matches with a promotion adjustment "
+                f"(attack ×{PROMOTION_ATTACK_DISCOUNT}, defense ×{PROMOTION_DEFENSE_PENALTY}) instead of "
+                f"the raw league average.")
+    if info["tier"] == "no match — league average":
+        return (f"⚠️ Couldn't find {team_name} in the top-flight OR second-tier data for the scanned window — "
+                f"using the 1.0 league-average fallback. If this team should have data, check "
+                f"`HIST_TEAM_ALIASES` for a naming mismatch.")
+    return None
+
+if "historical CSV" in lambda_source:
+    for _team, _info in ((home_team, home_tier_info), (away_team, away_tier_info)):
+        _msg = _tier_warning(_team, _info)
+        if _msg:
+            if "⚠️" in _msg:
+                st.warning(_msg)
+            else:
+                st.info(_msg)
+
+tier_summary = ""
+if "historical CSV" in lambda_source:
+    tier_summary = f" · {home_team}: {home_tier_info['tier']} ({home_tier_info['n']} matches) · {away_team}: {away_tier_info['tier']} ({away_tier_info['n']} matches)"
+st.caption(f"λ base source: **{lambda_source}**{tier_summary}")
 
 c1, c2, c3, c4 = st.columns(4)
 with c1:
