@@ -61,6 +61,17 @@ _STADIUM_CITIES = {
     "Ligue 1": ("Paris", 48.8566, 2.3522),
 }
 
+# BUGFIX: fetch_market_odds previously hardcoded "soccer_epl" for every league.
+# The Odds API needs the correct sport key per competition or it silently
+# queries the wrong league's odds (and misses every non-EPL match).
+ODDS_API_SPORT_KEYS = {
+    "Premier League": "soccer_epl",
+    "La Liga": "soccer_spain_la_liga",
+    "Serie A": "soccer_italy_serie_a",
+    "Bundesliga": "soccer_germany_bundesliga",
+    "Ligue 1": "soccer_france_ligue_one",
+}
+
 # ====================================================================================
 # 2. MOCK DATA GENERATORS (DEMO FALLBACKS)
 # ====================================================================================
@@ -271,10 +282,11 @@ def fetch_team_form(team_name: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_market_odds(home_team: str, away_team: str) -> dict:
+def fetch_market_odds(home_team: str, away_team: str, league_name: str = "Premier League") -> dict:
+    sport_key = ODDS_API_SPORT_KEYS.get(league_name, "soccer_epl")
     if THE_ODDS_API_KEY:
         try:
-            r = requests.get(f"{ODDS_API_BASE}/sports/soccer_epl/odds", params={"apiKey": THE_ODDS_API_KEY, "regions": "uk,eu", "markets": "h2h,totals", "oddsFormat": "decimal"}, timeout=6)
+            r = requests.get(f"{ODDS_API_BASE}/sports/{sport_key}/odds", params={"apiKey": THE_ODDS_API_KEY, "regions": "uk,eu", "markets": "h2h,totals", "oddsFormat": "decimal"}, timeout=6)
             r.raise_for_status()
             events = r.json()
             for ev in events:
@@ -284,7 +296,7 @@ def fetch_market_odds(home_team: str, away_team: str) -> dict:
                     prices = {o["name"]: o["price"] for o in h2h["outcomes"]}
                     return {
                         "1X2": {"home": prices.get(ev["home_team"]), "draw": prices.get("Draw"), "away": prices.get(ev["away_team"])},
-                        "source": f"The Odds API ({book['title']})"
+                        "source": f"The Odds API ({book['title']}, {sport_key})"
                     }
         except Exception:
             pass
@@ -416,13 +428,36 @@ def apply_margin(probs: dict, target_margin_pct: float) -> dict:
     return {k: round(fair_odds(v) / margin_factor, 2) for k, v in probs.items()}
 
 
-def devig_proportional(home_o: float, draw_o: float, away_o: float) -> Tuple[float, float, float]:
-    """Removes bookmaker overround to find true fair market probabilities."""
+def devig_proportional(home_o: float, draw_o: float, away_o: float) -> Optional[Tuple[float, float, float]]:
+    """
+    Removes bookmaker overround to find true fair market probabilities.
+
+    BUGFIX: previously returned (0.0, 0.0, 0.0) when any single price was
+    missing/invalid. Because these three values are computed ONCE and reused
+    across all three 1X2 rows, a single missing Draw price used to zero out
+    Home and Away's "fair market prob" too — inflating Edge (pp) to roughly
+    the full model probability and falsely tripping the VALUE signal on
+    outcomes whose prices were actually fine. Now returns None so the caller
+    can fall back to a per-market naive comparison instead of a corrupted one.
+    """
     if not all([home_o, draw_o, away_o]) or any(o <= 1.0 for o in [home_o, draw_o, away_o]):
-        return 0.0, 0.0, 0.0
+        return None
     raw_h, raw_d, raw_a = 1 / home_o, 1 / draw_o, 1 / away_o
     overround = raw_h + raw_d + raw_a
     return round(raw_h / overround, 4), round(raw_d / overround, 4), round(raw_a / overround, 4)
+
+
+def devig_two_way(odd_a: float, odd_b: float) -> Optional[Tuple[float, float]]:
+    """
+    Proportional devig for two-outcome markets (Over/Under 2.5, BTTS).
+    Replaces the previous hardcoded fair_mkt_prob=0.50 placeholder, which
+    ignored the actual bookmaker prices for these markets entirely.
+    """
+    if not odd_a or not odd_b or odd_a <= 1.0 or odd_b <= 1.0:
+        return None
+    raw_a, raw_b = 1 / odd_a, 1 / odd_b
+    overround = raw_a + raw_b
+    return round(raw_a / overround, 4), round(raw_b / overround, 4)
 
 
 def kelly_stake(model_prob: float, book_odds: float, fraction: float = 0.25) -> float:
@@ -530,7 +565,7 @@ away_model = TeamModelInputs(
 lam_home, lam_away = home_model.lambda_final, away_model.lambda_final
 matrix = scoreline_matrix(lam_home, lam_away, max_goals=7)
 model_probs = derive_markets(matrix)
-market_odds = fetch_market_odds(home_team, away_team)
+market_odds = fetch_market_odds(home_team, away_team, league)
 
 model_odds_1x2 = apply_margin(model_probs["1X2"], target_margin)
 model_odds_totals = apply_margin({"over_2_5": model_probs["over_2_5"], "under_2_5": model_probs["under_2_5"]}, target_margin)
@@ -574,17 +609,32 @@ st.divider()
 st.subheader("💰 Odds Engine, Devigged Market & Kelly Staking")
 
 book_1x2 = market_odds.get("1X2", {})
-fair_mkt_h, fair_mkt_d, fair_mkt_a = devig_proportional(book_1x2.get("home", 0), book_1x2.get("draw", 0), book_1x2.get("away", 0))
+devig_1x2 = devig_proportional(book_1x2.get("home", 0), book_1x2.get("draw", 0), book_1x2.get("away", 0))
+devig_ou = devig_two_way(market_odds.get("over_2_5"), market_odds.get("under_2_5"))
+devig_btts = devig_two_way(market_odds.get("btts_yes"), market_odds.get("btts_no"))
 
 def build_trade_row(market_label, model_prob, model_odd, book_odd, fair_mkt_prob):
     if not book_odd or book_odd <= 1.0:
         return {"Market": market_label, "Model Odds": model_odd, "Bookmaker Odds": "N/A", "Edge (pp)": 0, "Kelly Stake": "0.0%", "Signal": "N/A"}
-    
+
+    # BUGFIX: when the devig couldn't run (missing/partial bookmaker prices),
+    # fair_mkt_prob arrives as None here instead of a silently-wrong 0.0.
+    # Fall back to the raw (non-devigged) implied probability of this specific
+    # price and flag the row so it's clear the margin wasn't removed — this
+    # avoids fabricating a huge false edge on markets whose own price is fine.
+    devigged = True
+    if fair_mkt_prob is None:
+        fair_mkt_prob = 1 / book_odd
+        devigged = False
+
     edge_pp = round((model_prob - fair_mkt_prob) * 100, 2)
     stake_pct = kelly_stake(model_prob, book_odd, kelly_fraction)
-    
-    signal = "🟢 VALUE" if edge_pp >= 2.0 and stake_pct > 0 else ("🔴 OVERPRICED" if edge_pp <= -2.0 else "⚪ FAIR")
-    
+
+    if not devigged:
+        signal = "⚠️ NO DEVIG"
+    else:
+        signal = "🟢 VALUE" if edge_pp >= 2.0 and stake_pct > 0 else ("🔴 OVERPRICED" if edge_pp <= -2.0 else "⚪ FAIR")
+
     return {
         "Market": market_label,
         "Model Prob %": round(model_prob * 100, 1),
@@ -596,13 +646,17 @@ def build_trade_row(market_label, model_prob, model_odd, book_odd, fair_mkt_prob
         "Signal": signal
     }
 
+fair_mkt_h, fair_mkt_d, fair_mkt_a = devig_1x2 if devig_1x2 else (None, None, None)
+fair_ou_over, fair_ou_under = devig_ou if devig_ou else (None, None)
+fair_btts_yes, fair_btts_no = devig_btts if devig_btts else (None, None)
+
 trade_rows = [
     build_trade_row(f"1X2 — {home_team} Win", model_probs["1X2"]["home"], model_odds_1x2["home"], book_1x2.get("home"), fair_mkt_h),
     build_trade_row("1X2 — Draw", model_probs["1X2"]["draw"], model_odds_1x2["draw"], book_1x2.get("draw"), fair_mkt_d),
     build_trade_row(f"1X2 — {away_team} Win", model_probs["1X2"]["away"], model_odds_1x2["away"], book_1x2.get("away"), fair_mkt_a),
-    build_trade_row("Over 2.5 Goals", model_probs["over_2_5"], model_odds_totals["over_2_5"], market_odds.get("over_2_5"), 0.50),
-    build_trade_row("Under 2.5 Goals", model_probs["under_2_5"], model_odds_totals["under_2_5"], market_odds.get("under_2_5"), 0.50),
-    build_trade_row("BTTS — Yes", model_probs["btts_yes"], model_odds_btts["btts_yes"], market_odds.get("btts_yes"), 0.50),
+    build_trade_row("Over 2.5 Goals", model_probs["over_2_5"], model_odds_totals["over_2_5"], market_odds.get("over_2_5"), fair_ou_over),
+    build_trade_row("Under 2.5 Goals", model_probs["under_2_5"], model_odds_totals["under_2_5"], market_odds.get("under_2_5"), fair_ou_under),
+    build_trade_row("BTTS — Yes", model_probs["btts_yes"], model_odds_btts["btts_yes"], market_odds.get("btts_yes"), fair_btts_yes),
 ]
 
 comparison_df = pd.DataFrame(trade_rows)
