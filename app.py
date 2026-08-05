@@ -85,17 +85,17 @@ SECOND_TIER_DISPLAY_NAMES = {
     "F2": "Ligue 2",
 }
 
-# Rough, commonly-cited heuristic adjustments for a newly promoted club:
-# they tend to score less and concede more once they step up a division
-# compared to their previous tier's numbers. These are NOT fitted to this
-# dataset — treat them as a reasonable prior, not a calibrated estimate.
-# (Note: a reference snippet floating around uses 0.55/1.48 instead — a much
-# harsher penalty with the same unearned precision. Neither number is backed
-# by anything more rigorous than "commonly cited"; if you want this properly
-# calibrated, it should be backtested against actual promoted teams' first-
-# season top-flight numbers vs. their prior second-tier numbers.)
-PROMOTION_ATTACK_DISCOUNT = 0.85
-PROMOTION_DEFENSE_PENALTY = 1.15
+# Heuristic adjustment for a newly promoted club: they tend to score less
+# and concede more once they step up a division compared to their previous
+# tier's numbers. NOT fitted to this dataset — a chosen prior, not a
+# calibrated estimate. Switched (by request) from a milder 0.85/1.15 to this
+# harsher 0.55/1.48 pair, matching the reference document's values. Both
+# sets are equally unsourced; this one simply applies a bigger discount/
+# penalty. If you want this properly calibrated rather than chosen, it
+# should be backtested against actual promoted teams' first-season
+# top-flight numbers vs. their prior second-tier numbers.
+PROMOTION_ATTACK_DISCOUNT = 0.55
+PROMOTION_DEFENSE_PENALTY = 1.48
 
 _STADIUM_CITIES = {
     "Premier League": ("London", 51.5072, -0.1276),
