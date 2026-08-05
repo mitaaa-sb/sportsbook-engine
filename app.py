@@ -72,19 +72,36 @@ ODDS_API_SPORT_KEYS = {
     "Ligue 1": "soccer_france_ligue_one",
 }
 
+# Shared team pools per league — used by both mock fixtures AND mock season
+# stats so the two always stay in sync. Previously these were two separate
+# hardcoded lists (in _mock_fixtures and _mock_season_stats) that had drifted:
+# _mock_season_stats only covered 14 EPL/marquee teams while _mock_fixtures
+# pulled from ~30 teams across 5 leagues, so most non-EPL (and several EPL)
+# matchups silently fell back to a generic default lambda base instead of a
+# team-specific one. Defining the pool once and reusing it everywhere fixes
+# that gap and guarantees every fixture-eligible team has real mock stats.
+LEAGUE_TEAM_POOLS = {
+    "Premier League": ["Arsenal", "Man City", "Liverpool", "Chelsea", "Aston Villa", "Tottenham"],
+    "La Liga": ["Real Madrid", "Barcelona", "Atletico Madrid", "Real Sociedad", "Sevilla", "Villarreal"],
+    "Serie A": ["Inter", "Juventus", "AC Milan", "Napoli", "Roma", "Atalanta"],
+    "Bundesliga": ["Bayern Munich", "Dortmund", "RB Leipzig", "Leverkusen", "Union Berlin", "Freiburg"],
+    "Ligue 1": ["PSG", "Monaco", "Marseille", "Lyon", "Lille", "Nice"],
+}
+
+
+def _current_season_year() -> int:
+    """European football seasons span two calendar years; API-Football keys
+    stats by the year the season STARTED (e.g. 2025 for the 2025/26 season)."""
+    now = dt.datetime.now()
+    return now.year if now.month >= 7 else now.year - 1
+
+
 # ====================================================================================
 # 2. MOCK DATA GENERATORS (DEMO FALLBACKS)
 # ====================================================================================
 def _mock_fixtures(league: str) -> pd.DataFrame:
     random.seed(hash(league) % 1000)
-    teams_pool = {
-        "Premier League": ["Arsenal", "Man City", "Liverpool", "Chelsea", "Aston Villa", "Tottenham"],
-        "La Liga": ["Real Madrid", "Barcelona", "Atletico Madrid", "Real Sociedad", "Sevilla", "Villarreal"],
-        "Serie A": ["Inter", "Juventus", "AC Milan", "Napoli", "Roma", "Atalanta"],
-        "Bundesliga": ["Bayern Munich", "Dortmund", "RB Leipzig", "Leverkusen", "Union Berlin", "Freiburg"],
-        "Ligue 1": ["PSG", "Monaco", "Marseille", "Lyon", "Lille", "Nice"],
-    }
-    teams = teams_pool.get(league, teams_pool["Premier League"])
+    teams = LEAGUE_TEAM_POOLS.get(league, LEAGUE_TEAM_POOLS["Premier League"]).copy()
     fixtures = []
     base_date = dt.datetime.now() + dt.timedelta(days=2)
     random.shuffle(teams)
@@ -100,8 +117,7 @@ def _mock_fixtures(league: str) -> pd.DataFrame:
 
 def _mock_season_stats(league: str) -> pd.DataFrame:
     random.seed(hash(league) % 2000)
-    teams = ["Arsenal", "Man City", "Liverpool", "Chelsea", "Aston Villa", "Tottenham", 
-             "Real Madrid", "Barcelona", "Atletico Madrid", "Inter", "AC Milan", "Bayern Munich", "PSG", "Coventry City"]
+    teams = LEAGUE_TEAM_POOLS.get(league, LEAGUE_TEAM_POOLS["Premier League"])
     data = []
     for t in teams:
         data.append({
@@ -216,68 +232,223 @@ def fetch_fixtures(league_name: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_team_season_stats(league_name: str) -> pd.DataFrame:
+    """
+    Team-level attack/defense inputs consumed by calculate_team_base_lambdas.
+
+    ROOT-CAUSE BUGFIX (this is why the model showed Arsenal at ~2.91 while
+    every bookmaker had them at ~1.16): this function previously returned
+    `_mock_season_stats(league_name)` UNCONDITIONALLY — there was no live
+    branch at all, regardless of whether FOOTBALL_DATA_KEY was configured.
+    That means every team's modelled attack/defense strength was random noise
+    (np.random.uniform per team) with zero relationship to their real quality.
+    The Odds API side of the app was showing real bookmaker consensus, but the
+    statistical model's own inputs were completely disconnected from reality
+    — so a big favorite could easily come out underpriced by the model purely
+    by chance of the random seed.
+
+    Now, when FOOTBALL_DATA_KEY is set, this pulls the LIVE competition
+    standings (home/away split) from football-data.org and derives goals-for
+    / goals-against per game as a real, direction-correct proxy for attack and
+    defense strength. Note: this is a goals-based proxy, not true xG — football-
+    data.org's free tier doesn't expose expected goals. If you want genuine xG
+    here, wire in soccerdata's Understat reader (see comment at the bottom of
+    this function) in place of the goals proxy.
+    """
+    league_code = LEAGUES.get(league_name)
+    if FOOTBALL_DATA_KEY:
+        try:
+            headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
+            r = requests.get(
+                f"{FOOTBALL_DATA_BASE}/competitions/{league_code}/standings",
+                headers=headers, timeout=8,
+            )
+            r.raise_for_status()
+            standings = r.json().get("standings", [])
+            home_table = next((s["table"] for s in standings if s.get("type") == "HOME"), None)
+            away_table = next((s["table"] for s in standings if s.get("type") == "AWAY"), None)
+
+            if home_table and away_table:
+                home_lookup = {row["team"]["name"]: row for row in home_table}
+                away_lookup = {row["team"]["name"]: row for row in away_table}
+                rows = []
+                for name in set(home_lookup) & set(away_lookup):
+                    h, a = home_lookup[name], away_lookup[name]
+                    if not h.get("playedGames") or not a.get("playedGames"):
+                        continue  # no matches played yet in that split — skip rather than divide by zero
+                    rows.append({
+                        "team": name,
+                        "home_xG_for": round(h["goalsFor"] / h["playedGames"], 2),
+                        "home_xG_against": round(h["goalsAgainst"] / h["playedGames"], 2),
+                        "away_xG_for": round(a["goalsFor"] / a["playedGames"], 2),
+                        "away_xG_against": round(a["goalsAgainst"] / a["playedGames"], 2),
+                    })
+                if rows:
+                    return pd.DataFrame(rows)
+        except Exception:
+            pass
+        # --------------------------------------------------------------
+        # >>> TRUE xG FETCHER CONFIGURATION POINT <<<
+        # Replace/augment the block above with soccerdata's Understat reader
+        # for real expected-goals data instead of the goals-based proxy:
+        #   import soccerdata as sd
+        #   understat = sd.Understat(leagues=UNDERSTAT_LEAGUE_MAP[league_name], seasons=_current_season_year())
+        #   team_stats = understat.read_team_match_stats()  # has xG/xGA per match
+        # --------------------------------------------------------------
     return _mock_season_stats(league_name)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_squad(team_name: str, seed_offset: int = 0) -> pd.DataFrame:
-    """Fetches real player rosters from API-Football if key exists, otherwise falls back to mock."""
+    """
+    Live squad + per-player season stats from API-Football.
+
+    BUGFIX: previously fetched the real squad list (names/positions) but then
+    assigned every player a FIXED constant xG90/xA90 purely from their
+    position (e.g. every midfielder got exactly 0.14/0.22) — so PIV could
+    never tell a star player apart from a benchwarmer in the same position,
+    and the "player impact" driving lambda wasn't actually reflecting who's
+    good. This now calls API-Football's `/players` endpoint (team + season)
+    to pull each player's real season goals/assists/minutes and derives
+    per-90 rates as a goals-based proxy for xG90/xA90 (API-Football's free
+    tier doesn't expose true xG — see the fetcher configuration comment
+    below for wiring in real xG via soccerdata/Understat instead).
+    """
     if API_FOOTBALL_KEY:
         try:
-            headers = {
-                "x-apisports-key": API_FOOTBALL_KEY
-            }
+            headers = {"x-apisports-key": API_FOOTBALL_KEY}
             clean_name = team_name.replace(" FC", "").replace(" AFC", "").replace(" Football Club", "")
             r_team = requests.get(
                 f"https://{API_FOOTBALL_HOST}/teams",
-                headers=headers,
-                params={"search": clean_name},
-                timeout=6
+                headers=headers, params={"search": clean_name}, timeout=6,
             )
             r_team.raise_for_status()
             team_res = r_team.json().get("response", [])
-            
+
             if team_res:
                 team_id = team_res[0]["team"]["id"]
-                r_squad = requests.get(
-                    f"https://{API_FOOTBALL_HOST}/players/squads",
-                    headers=headers,
-                    params={"team": team_id},
-                    timeout=6
-                )
-                r_squad.raise_for_status()
-                squad_res = r_squad.json().get("response", [])
-                
-                if squad_res and "players" in squad_res[0]:
-                    players = squad_res[0]["players"]
-                    rows = []
-                    pos_map = {"Goalkeeper": "GK", "Defender": "DF", "Midfielder": "MF", "Attacker": "FW"}
-                    
-                    for p in players:
-                        pos = pos_map.get(p.get("position"), "MF")
-                        xg90 = 0.38 if pos == "FW" else 0.14 if pos == "MF" else 0.02
-                        xa90 = 0.22 if pos in ("FW", "MF") else 0.04
-                        
+                season = _current_season_year()
+                pos_map = {"Goalkeeper": "GK", "Defender": "DF", "Midfielder": "MF", "Attacker": "FW"}
+                # Position-average fallback ONLY for players with 0 minutes
+                # logged yet this season (new signings, kids coming through) —
+                # not applied blanket to the whole squad like before.
+                fallback_xg90 = {"FW": 0.30, "MF": 0.10, "DF": 0.02, "GK": 0.0}
+                fallback_xa90 = {"FW": 0.15, "MF": 0.16, "DF": 0.03, "GK": 0.0}
+
+                rows, page, total_pages = [], 1, 1
+                while page <= total_pages and page <= 3:  # cap pages to respect free-tier rate limits
+                    # --------------------------------------------------------------
+                    # >>> PLAYER STAT FETCHER CONFIGURATION POINT <<<
+                    # This is the real live source for per-player season stats.
+                    # --------------------------------------------------------------
+                    r_stats = requests.get(
+                        f"https://{API_FOOTBALL_HOST}/players",
+                        headers=headers, params={"team": team_id, "season": season, "page": page}, timeout=8,
+                    )
+                    r_stats.raise_for_status()
+                    payload = r_stats.json()
+                    total_pages = payload.get("paging", {}).get("total", 1)
+
+                    for p in payload.get("response", []):
+                        info = p.get("player", {})
+                        stat = (p.get("statistics") or [{}])[0]
+                        games = stat.get("games", {}) or {}
+                        goals = stat.get("goals", {}) or {}
+                        minutes = games.get("minutes") or 0
+                        pos = pos_map.get(games.get("position"), "MF")
+                        goals_total = goals.get("total") or 0
+                        assists_total = goals.get("assists") or 0
+                        rating_raw = games.get("rating")
+                        rating = round(float(rating_raw), 2) if rating_raw else 6.8
+
+                        if minutes and minutes > 0:
+                            xg90 = round(goals_total / minutes * 90, 3)
+                            xa90 = round(assists_total / minutes * 90, 3)
+                        else:
+                            xg90 = fallback_xg90.get(pos, 0.08)
+                            xa90 = fallback_xa90.get(pos, 0.05)
+
                         rows.append({
-                            "player": p.get("name"),
+                            "player": info.get("name"),
                             "position": pos,
-                            "minutes": 1200,
+                            "minutes": minutes,
                             "xG90": xg90,
                             "xA90": xa90,
-                            "key_passes90": 1.1 if pos == "MF" else 0.5,
-                            "avg_rating": 7.1,
-                            "status": "Active"
+                            "key_passes90": round(assists_total / max(minutes, 1) * 90 * 1.8, 2),
+                            "avg_rating": rating,
+                            "status": "Active",
                         })
-                    if rows:
-                        return pd.DataFrame(rows)
+                    page += 1
+
+                if rows:
+                    return pd.DataFrame(rows)
         except Exception:
             pass
+        # --------------------------------------------------------------
+        # >>> TRUE xG/xA FETCHER CONFIGURATION POINT <<<
+        # Replace the goals-based proxy above with real per-player xG/xA:
+        #   import soccerdata as sd
+        #   understat = sd.Understat(leagues=..., seasons=_current_season_year())
+        #   player_stats = understat.read_player_season_stats()
+        # --------------------------------------------------------------
 
     return _mock_squad(team_name, seed_offset)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_team_form(team_name: str) -> pd.DataFrame:
+def fetch_team_form(team_name: str, league_name: str = "Premier League") -> pd.DataFrame:
+    """
+    5-match rolling form (goals/xG-proxy for and against, most recent last).
+
+    BUGFIX: previously returned `_mock_form(team_name)` unconditionally, same
+    class of bug as fetch_team_season_stats above — a team's "recent form"
+    was pure random noise regardless of API keys. Now pulls the team's last
+    5 finished matches from football-data.org when FOOTBALL_DATA_KEY is set,
+    using actual goals for/against as the xG proxy (again: goals, not true
+    xG — see the fetcher configuration comment for wiring in real xG).
+    """
+    league_code = LEAGUES.get(league_name)
+    if FOOTBALL_DATA_KEY:
+        try:
+            headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
+            r_std = requests.get(
+                f"{FOOTBALL_DATA_BASE}/competitions/{league_code}/standings",
+                headers=headers, timeout=8,
+            )
+            r_std.raise_for_status()
+            total_table = next(
+                (s["table"] for s in r_std.json().get("standings", []) if s.get("type") == "TOTAL"), []
+            )
+            team_id = next((row["team"]["id"] for row in total_table if row["team"]["name"] == team_name), None)
+
+            if team_id:
+                r_m = requests.get(
+                    f"{FOOTBALL_DATA_BASE}/teams/{team_id}/matches",
+                    headers=headers, params={"status": "FINISHED", "limit": 5}, timeout=8,
+                )
+                r_m.raise_for_status()
+                matches = r_m.json().get("matches", [])[-5:]
+                rows = []
+                for idx, m in enumerate(matches):
+                    is_home = m["homeTeam"]["name"] == team_name
+                    gf = m["score"]["fullTime"]["home"] if is_home else m["score"]["fullTime"]["away"]
+                    ga = m["score"]["fullTime"]["away"] if is_home else m["score"]["fullTime"]["home"]
+                    if gf is None or ga is None:
+                        continue
+                    rows.append({
+                        "matches_ago": len(matches) - idx,
+                        "goals_for": gf, "goals_against": ga,
+                        "xG_for": gf, "xG_against": ga,  # goals-based proxy, not true xG
+                    })
+                if len(rows) >= 3:
+                    return pd.DataFrame(rows)
+        except Exception:
+            pass
+        # --------------------------------------------------------------
+        # >>> TRUE xG FORM FETCHER CONFIGURATION POINT <<<
+        # Replace the goals-based proxy above with soccerdata's Understat
+        # reader for genuine per-match xG/xGA:
+        #   understat.read_team_match_stats()  # then take last 5 rows
+        # --------------------------------------------------------------
     return _mock_form(team_name)
 
 
@@ -502,6 +673,14 @@ st.sidebar.markdown(f"{'🟢' if FOOTBALL_DATA_KEY else '🔴'} football-data.or
 st.sidebar.markdown(f"{'🟢' if THE_ODDS_API_KEY else '🔴'} The Odds API")
 st.sidebar.markdown("🟢 Open-Meteo Weather")
 
+if st.sidebar.button("🔄 Refresh Rosters & Live Stats", use_container_width=True):
+    # All fetch_* functions are @st.cache_data — this clears every cached
+    # response (fixtures, season stats, squads, form, odds, weather) so the
+    # next run pulls fresh data instead of a stale cached roster/injury list.
+    st.cache_data.clear()
+    st.rerun()
+st.sidebar.caption("Cached for 15–30 min per source. Use refresh after squad/injury news breaks.")
+
 st.sidebar.divider()
 league = st.sidebar.selectbox("Select League", list(LEAGUES.keys()))
 fixtures_df = fetch_fixtures(league)
@@ -544,8 +723,8 @@ w_mult = weather_modifier(weather)
 season_stats = fetch_team_season_stats(league)
 base_lam_home, base_lam_away = calculate_team_base_lambdas(home_team, away_team, season_stats)
 
-home_form_df = fetch_team_form(home_team)
-away_form_df = fetch_team_form(away_team)
+home_form_df = fetch_team_form(home_team, league)
+away_form_df = fetch_team_form(away_team, league)
 
 home_piv_mult, home_squad = player_impact_score(home_squad_raw, home_active)
 away_piv_mult, away_squad = player_impact_score(away_squad_raw, away_active)
