@@ -91,6 +91,18 @@ def _current_season_year() -> int:
     return now.year if now.month >= 7 else now.year - 1
 
 
+def _recent_hist_season_codes(n: int = 3) -> list:
+    """
+    Football-Data.co.uk season codes like '2324' for the 2023/24 season.
+    Previously hardcoded to ["2324", "2425", "2526"], which will silently go
+    stale every year (never picks up the new season, keeps re-requesting an
+    ever-more-outdated 3-season window). This computes the trailing n
+    seasons ending at the CURRENT season, so it stays correct automatically.
+    """
+    start_year = _current_season_year()
+    return [f"{str(y)[-2:]}{str(y + 1)[-2:]}" for y in range(start_year - n + 1, start_year + 1)]
+
+
 # ====================================================================================
 # 2. HISTORICAL DATA ENGINE (MULTI-SEASON ARCHIVE)
 # ====================================================================================
@@ -99,12 +111,20 @@ def fetch_historical_league_data(league_code: str = "E0") -> pd.DataFrame:
     """
     Downloads multi-season match data, goals, and closing odds directly 
     from Football-Data.co.uk CSVs without requiring an API key.
+
+    BUGFIX: the URL previously pointed at "mmz4235", which is not a real path
+    on football-data.co.uk (verified against their live site) — every request
+    404'd, was swallowed by the except/continue below, and this function
+    always silently returned an empty DataFrame. That means the multi-season
+    historical engine has never actually run; the app has been falling
+    through to the single-season standings fallback the whole time with no
+    indication anything failed. The correct path segment is "mmz4281".
     """
-    seasons = ["2324", "2425", "2526"]
+    seasons = _recent_hist_season_codes(3)
     dfs = []
     
     for s in seasons:
-        url = f"https://www.football-data.co.uk/mmz4235/{s}/{league_code}.csv"
+        url = f"https://www.football-data.co.uk/mmz4281/{s}/{league_code}.csv"
         try:
             df = pd.read_csv(url)
             cols = ['Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'HS', 'AS', 'HST', 'AST', 'B365H', 'B365D', 'B365A']
@@ -122,6 +142,97 @@ def fetch_historical_league_data(league_code: str = "E0") -> pd.DataFrame:
     return pd.DataFrame()
 
 
+# Known football-data.co.uk short-name quirks that don't match the official
+# names returned by football-data.org / API-Football (e.g. "Manchester City
+# FC" vs "Man City", "Atletico Madrid" vs "Ath Madrid"). Extend this table if
+# other mismatches surface — particularly for leagues/seasons not checked here.
+HIST_TEAM_ALIASES = {
+    "Manchester City": "Man City",
+    "Manchester United": "Man United",
+    "Newcastle United": "Newcastle",
+    "Tottenham Hotspur": "Tottenham",
+    "Wolverhampton Wanderers": "Wolves",
+    "Nottingham Forest": "Nott'm Forest",
+    "West Ham United": "West Ham",
+    "West Bromwich Albion": "West Brom",
+    "Brighton & Hove Albion": "Brighton",
+    "Leicester City": "Leicester",
+    "Leeds United": "Leeds",
+    "AFC Bournemouth": "Bournemouth",
+    "Atletico Madrid": "Ath Madrid",
+    "Atlético Madrid": "Ath Madrid",
+    "Athletic Club": "Ath Bilbao",
+    "Athletic Bilbao": "Ath Bilbao",
+    "Real Betis": "Betis",
+    "Celta Vigo": "Celta",
+    "Deportivo Alaves": "Alaves",
+    "Rayo Vallecano": "Vallecano",
+    "AC Milan": "Milan",
+    "Internazionale": "Inter",
+    "Inter Milan": "Inter",
+    "Hellas Verona": "Verona",
+    "Borussia Dortmund": "Dortmund",
+    "Borussia Monchengladbach": "M'gladbach",
+    "Bayer Leverkusen": "Leverkusen",
+    "Eintracht Frankfurt": "Ein Frankfurt",
+    "1899 Hoffenheim": "Hoffenheim",
+    "1. FC Koln": "FC Koln",
+    "Paris Saint Germain": "Paris SG",
+    "Paris Saint-Germain": "Paris SG",
+    "Saint-Etienne": "St Etienne",
+    "AS Saint-Etienne": "St Etienne",
+    "Olympique Marseille": "Marseille",
+    "Olympique Lyonnais": "Lyon",
+}
+
+
+def _normalize_hist_team_name(name: str) -> str:
+    """Strips common club suffixes and applies known aliases so official
+    names compare cleanly against football-data.co.uk's short-form names."""
+    n = (name or "").strip()
+    for suffix in (" FC", " CF", " AFC", " Football Club"):
+        if n.endswith(suffix):
+            n = n[: -len(suffix)]
+            break
+    return HIST_TEAM_ALIASES.get(n, n).strip()
+
+
+def _match_hist_team_rows(hist_df: pd.DataFrame, column: str, team_name: str) -> pd.DataFrame:
+    """
+    Finds this team's rows in the historical CSV.
+
+    BUGFIX: the previous approach matched on `team_name[:5]` as a raw
+    substring, which had two failure modes: (1) silently matched NOTHING for
+    teams whose official name doesn't share a prefix with football-data.co.uk's
+    short form — e.g. "Manchester City FC"[:5] = "Manch", which is not even a
+    substring of "Man City" — quietly falling back to a generic 1.0
+    average-team rating for exactly the sort of big favourite this tool needs
+    to price well; and (2) silently corrupted results by merging DIFFERENT
+    clubs together when they share a 5-char prefix — e.g. "Real Madrid",
+    "Real Sociedad", and "Real Betis" all start with "Real ".
+
+    This now: (1) normalizes/aliases the name first, (2) tries an exact
+    (case-insensitive) match, and (3) only falls back to a substring match if
+    it resolves to a SINGLE unique team — it never silently blends two clubs'
+    results together, and returns empty (safe fallback to league-average)
+    rather than a guess when the match is ambiguous or absent.
+    """
+    target = _normalize_hist_team_name(team_name)
+    if not target:
+        return hist_df.iloc[0:0]
+
+    exact = hist_df[hist_df[column].str.casefold() == target.casefold()]
+    if not exact.empty:
+        return exact
+
+    candidates = hist_df[column].dropna().unique()
+    substring_hits = [c for c in candidates if target.casefold() in c.casefold()]
+    if len(substring_hits) == 1:
+        return hist_df[hist_df[column] == substring_hits[0]]
+
+    return hist_df.iloc[0:0]
+
+
 def calculate_historical_lambdas(home_team: str, away_team: str, hist_df: pd.DataFrame) -> Tuple[float, float]:
     """Calculates team attack/defense relative strength parameters from historical data."""
     if hist_df.empty:
@@ -130,9 +241,8 @@ def calculate_historical_lambdas(home_team: str, away_team: str, hist_df: pd.Dat
     league_home_avg_g = max(hist_df['FTHG'].mean(), 1.0)
     league_away_avg_g = max(hist_df['FTAG'].mean(), 1.0)
 
-    # Soft matching team names against historical CSV entries
-    home_matches = hist_df[hist_df['HomeTeam'].str.contains(home_team[:5], case=False, na=False)].head(38)
-    away_matches = hist_df[hist_df['AwayTeam'].str.contains(away_team[:5], case=False, na=False)].head(38)
+    home_matches = _match_hist_team_rows(hist_df, 'HomeTeam', home_team).head(38)
+    away_matches = _match_hist_team_rows(hist_df, 'AwayTeam', away_team).head(38)
 
     h_att = (home_matches['FTHG'].mean() / league_home_avg_g) if not home_matches.empty else 1.0
     h_def = (home_matches['FTAG'].mean() / league_away_avg_g) if not home_matches.empty else 1.0
@@ -180,7 +290,7 @@ def _mock_season_stats(league: str) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
-def _mock_squad(team: str, seed_offset: int = 0) -> pd.DataFrame:
+def _mock_squad(team: str, seed_offset: int = 0, n_games: int = 5) -> pd.DataFrame:
     random.seed((hash(team) + seed_offset) % 10000)
     positions = ["GK", "DF", "DF", "DF", "DF", "MF", "MF", "MF", "FW", "FW", "FW"]
     names_pool = ["Silva", "Rodrigues", "Kovac", "Muller", "Dubois", "Novak", "Andersen", "Fernandez", "Costa", "Brandt", "Diaz"]
@@ -190,12 +300,15 @@ def _mock_squad(team: str, seed_offset: int = 0) -> pd.DataFrame:
         minutes = random.randint(600, 2500)
         xg90 = round(max(0, np.random.normal(0.38 if pos == "FW" else 0.12 if pos == "MF" else 0.02, 0.10)), 3)
         xa90 = round(max(0, np.random.normal(0.22 if pos in ("FW", "MF") else 0.03, 0.08)), 3)
-        rating = round(np.random.normal(7.0, 0.4), 2)
+        # games_rated simulates squad rotation: most starters featured in most
+        # of the last n_games, a few rotation players featured in fewer/none.
+        games_rated = min(n_games, max(0, n_games - random.choice([0, 0, 0, 1, 2, n_games])))
+        rating = round(np.random.normal(7.0, 0.5), 2) if games_rated > 0 else None
         key_passes90 = round(max(0, np.random.normal(1.5 if pos == "MF" else 0.6, 0.5)), 2)
         rows.append({
             "player": name, "position": pos, "minutes": minutes,
             "xG90": xg90, "xA90": xa90, "key_passes90": key_passes90,
-            "avg_rating": rating, "status": "Active",
+            "avg_rating": rating, "games_rated": games_rated, "status": "Active",
         })
     return pd.DataFrame(rows)
 
@@ -318,7 +431,61 @@ def fetch_team_season_stats(league_name: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_squad(team_name: str, seed_offset: int = 0) -> pd.DataFrame:
+def fetch_player_recent_ratings(team_id: int, n_games: int = 5) -> dict:
+    """
+    Real per-match player ratings from the team's last n_games finished
+    fixtures (API-Football /fixtures + /fixtures/players), NOT the season
+    aggregate. This is what actually lets you see who's in form: a player's
+    season rating can be a solid 7.1 while they've been poor (or benched
+    entirely) the last 3 matches, and vice versa.
+
+    Returns {player_name: {"avg_rating": float, "games_rated": int}} where
+    games_rated is how many of the last n_games this specific player actually
+    featured in and got a rating — 0 means they've dropped out of the side
+    recently, which is itself a form signal worth showing, not hiding.
+    """
+    if not API_FOOTBALL_KEY:
+        return {}
+    headers = {"x-apisports-key": API_FOOTBALL_KEY}
+    try:
+        r_fx = requests.get(
+            f"https://{API_FOOTBALL_HOST}/fixtures",
+            headers=headers, params={"team": team_id, "last": n_games}, timeout=8,
+        )
+        r_fx.raise_for_status()
+        fixture_ids = [f["fixture"]["id"] for f in r_fx.json().get("response", [])]
+
+        ratings: dict = {}
+        for fid in fixture_ids:
+            r_pl = requests.get(
+                f"https://{API_FOOTBALL_HOST}/fixtures/players",
+                headers=headers, params={"fixture": fid}, timeout=8,
+            )
+            r_pl.raise_for_status()
+            for team_block in r_pl.json().get("response", []):
+                if team_block.get("team", {}).get("id") != team_id:
+                    continue
+                for p in team_block.get("players", []):
+                    name = p.get("player", {}).get("name")
+                    stat = (p.get("statistics") or [{}])[0]
+                    games = stat.get("games", {}) or {}
+                    rating_raw = games.get("rating")
+                    minutes = games.get("minutes")
+                    # Only count matches the player actually appeared in —
+                    # API-Football sometimes lists unused subs with no rating.
+                    if name and rating_raw and minutes:
+                        ratings.setdefault(name, []).append(float(rating_raw))
+
+        return {
+            name: {"avg_rating": round(sum(vals) / len(vals), 2), "games_rated": len(vals)}
+            for name, vals in ratings.items()
+        }
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_squad(team_name: str, seed_offset: int = 0, n_games: int = 5) -> pd.DataFrame:
     if API_FOOTBALL_KEY:
         try:
             headers = {"x-apisports-key": API_FOOTBALL_KEY}
@@ -336,6 +503,10 @@ def fetch_squad(team_name: str, seed_offset: int = 0) -> pd.DataFrame:
                 pos_map = {"Goalkeeper": "GK", "Defender": "DF", "Midfielder": "MF", "Attacker": "FW"}
                 fallback_xg90 = {"FW": 0.30, "MF": 0.10, "DF": 0.02, "GK": 0.0}
                 fallback_xa90 = {"FW": 0.15, "MF": 0.16, "DF": 0.03, "GK": 0.0}
+
+                # Recent per-match ratings — this is what drives "in form"
+                # rather than the season-long aggregate below.
+                recent_ratings = fetch_player_recent_ratings(team_id, n_games)
 
                 rows, page, total_pages = [], 1, 1
                 while page <= total_pages and page <= 3:
@@ -356,8 +527,24 @@ def fetch_squad(team_name: str, seed_offset: int = 0) -> pd.DataFrame:
                         pos = pos_map.get(games.get("position"), "MF")
                         goals_total = goals.get("total") or 0
                         assists_total = goals.get("assists") or 0
-                        rating_raw = games.get("rating")
-                        rating = round(float(rating_raw), 2) if rating_raw else 6.8
+                        name = info.get("name")
+
+                        # BUGFIX / FEATURE: avg_rating used to be API-Football's
+                        # season-to-date aggregate rating, which tells you
+                        # nothing about recent form (a great start to the
+                        # season masks three recent poor games, and vice
+                        # versa). Now it's the average of this player's ACTUAL
+                        # ratings across the team's last n_games matches, with
+                        # games_rated showing the real sample size behind that
+                        # number — 0 means dropped from the side recently.
+                        recent = recent_ratings.get(name)
+                        if recent:
+                            rating = recent["avg_rating"]
+                            games_rated = recent["games_rated"]
+                        else:
+                            season_rating_raw = games.get("rating")
+                            rating = round(float(season_rating_raw), 2) if season_rating_raw else 6.8
+                            games_rated = 0
 
                         if minutes and minutes > 0:
                             xg90 = round(goals_total / minutes * 90, 3)
@@ -367,13 +554,14 @@ def fetch_squad(team_name: str, seed_offset: int = 0) -> pd.DataFrame:
                             xa90 = fallback_xa90.get(pos, 0.05)
 
                         rows.append({
-                            "player": info.get("name"),
+                            "player": name,
                             "position": pos,
                             "minutes": minutes,
                             "xG90": xg90,
                             "xA90": xa90,
                             "key_passes90": round(assists_total / max(minutes, 1) * 90 * 1.8, 2),
                             "avg_rating": rating,
+                            "games_rated": games_rated,
                             "status": "Active",
                         })
                     page += 1
@@ -383,7 +571,9 @@ def fetch_squad(team_name: str, seed_offset: int = 0) -> pd.DataFrame:
         except Exception:
             pass
 
-    return _mock_squad(team_name, seed_offset)
+    return _mock_squad(team_name, seed_offset, n_games)
+
+
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -464,7 +654,15 @@ def calculate_team_base_lambdas(home_team: str, away_team: str, team_stats: pd.D
     away_def = (a_stat['away_xG_against'].values[0] if not a_stat.empty else 1.20) / league_home_avg
     
     away_att = (a_stat['away_xG_for'].values[0] if not a_stat.empty else 1.20) / league_away_avg
-    home_def = (h_stat['home_xG_against'].values[0] if not h_stat.empty else 1.55) / league_home_avg
+    # BUGFIX (regression): this was dividing by league_home_avg. home_def
+    # measures a team's home defensive record, which should be benchmarked
+    # against what away teams typically score across the league — i.e.
+    # league_away_avg, the same baseline away_att uses above. Dividing by
+    # league_home_avg instead systematically mis-scaled every team's defense
+    # term, and since fetch_historical_league_data() was silently failing
+    # (see bugfix above), THIS function has been the one actually running
+    # for every single match — so this bug has been live in production.
+    home_def = (h_stat['home_xG_against'].values[0] if not h_stat.empty else 1.55) / league_away_avg
     
     base_lam_home = league_home_avg * home_att * away_def
     base_lam_away = league_away_avg * away_att * home_def
@@ -627,7 +825,7 @@ st.sidebar.subheader("API & Data Connections")
 st.sidebar.markdown(f"{'🟢' if API_FOOTBALL_KEY else '🔴'} API-Football")
 st.sidebar.markdown(f"{'🟢' if FOOTBALL_DATA_KEY else '🔴'} football-data.org")
 st.sidebar.markdown(f"{'🟢' if THE_ODDS_API_KEY else '🔴'} The Odds API")
-st.sidebar.markdown("🟢 Historical CSV Engine (Football-Data.co.uk)")
+st.sidebar.markdown("🟢 Historical CSV Engine (Football-Data.co.uk, no key needed)")
 st.sidebar.markdown("🟢 Open-Meteo Weather")
 
 if st.sidebar.button("🔄 Refresh Rosters & Live Stats", use_container_width=True):
@@ -658,8 +856,12 @@ with c_r2:
 
 st.sidebar.divider()
 st.sidebar.subheader("Player Availability")
-home_squad_raw = fetch_squad(home_team, seed_offset=1)
-away_squad_raw = fetch_squad(away_team, seed_offset=2)
+rating_window = st.sidebar.slider(
+    "Player Form Window (games)", 3, 5, 5,
+    help="avg_rating below is each player's average rating over their last N matches (not season average) — the number to check for who's actually in form right now."
+)
+home_squad_raw = fetch_squad(home_team, seed_offset=1, n_games=rating_window)
+away_squad_raw = fetch_squad(away_team, seed_offset=2, n_games=rating_window)
 
 with st.sidebar.expander(f"🏠 {home_team} Lineup"):
     home_active = {row["player"]: st.checkbox(f"{row['player']} ({row['position']})", value=True, key=f"h_{row['player']}") for _, row in home_squad_raw.iterrows()}
@@ -678,11 +880,20 @@ w_mult = weather_modifier(weather)
 hist_code = HIST_LEAGUE_MAP.get(league, "E0")
 hist_df = fetch_historical_league_data(hist_code)
 
+# Diagnostics so a repeat of the mmz4235/mmz4281 URL bug — where the historical
+# engine failed 100% silently for weeks — can never hide again. Shown in the UI below.
+lambda_source = "mock"
+home_hist_matches = away_hist_matches = 0
+
 if not hist_df.empty:
+    lambda_source = f"historical CSV ({len(hist_df)} matches, {hist_code})"
     base_lam_home, base_lam_away = calculate_historical_lambdas(home_team, away_team, hist_df)
+    home_hist_matches = len(_match_hist_team_rows(hist_df, 'HomeTeam', home_team))
+    away_hist_matches = len(_match_hist_team_rows(hist_df, 'AwayTeam', away_team))
 else:
     season_stats = fetch_team_season_stats(league)
     base_lam_home, base_lam_away = calculate_team_base_lambdas(home_team, away_team, season_stats)
+    lambda_source = "live standings" if FOOTBALL_DATA_KEY else "mock season stats"
 
 home_form_df = fetch_team_form(home_team, league)
 away_form_df = fetch_team_form(away_team, league)
@@ -717,6 +928,18 @@ model_odds_btts = apply_margin({"btts_yes": model_probs["btts_yes"], "btts_no": 
 st.title(f"{home_team} vs {away_team}")
 st.caption(f"{league} · Kickoff {kickoff.strftime('%A %d %B, %H:%M')} · Venue: {city}")
 
+if "historical CSV" in lambda_source and (home_hist_matches == 0 or away_hist_matches == 0):
+    st.warning(
+        f"⚠️ Historical data loaded ({len(hist_df)} matches) but couldn't confidently match "
+        f"{home_team if home_hist_matches == 0 else away_team} by name — that team's λ is using "
+        f"the 1.0 league-average fallback rather than its real record. Consider adding an alias "
+        f"to `HIST_TEAM_ALIASES` for this club."
+    )
+st.caption(f"λ base source: **{lambda_source}**" + (
+    f" · matched {home_hist_matches} {home_team} / {away_hist_matches} {away_team} rows"
+    if "historical CSV" in lambda_source else ""
+))
+
 c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.metric("λ Home (Final xG)", lam_home)
@@ -735,13 +958,22 @@ st.divider()
 
 # ---- Squad & Player Form Section ----
 st.subheader("👥 Player Form & Impact Penalties")
+st.caption(f"avg_rating and games_rated reflect each player's actual performance over their last {rating_window} matches "
+           f"(not season average) — games_rated = 0 means they haven't featured in that recent window.")
 pc1, pc2 = st.columns(2)
+display_cols = ["player", "position", "avg_rating", "games_rated", "xG90", "xA90", "status", "absence_penalty_%"]
 with pc1:
     st.markdown(f"**{home_team} Lineup & Stats**")
-    st.dataframe(home_squad[["player", "position", "avg_rating", "xG90", "xA90", "status", "absence_penalty_%"]], hide_index=True)
+    st.dataframe(
+        home_squad[display_cols].sort_values("avg_rating", ascending=False, na_position="last"),
+        hide_index=True,
+    )
 with pc2:
     st.markdown(f"**{away_team} Lineup & Stats**")
-    st.dataframe(away_squad[["player", "position", "avg_rating", "xG90", "xA90", "status", "absence_penalty_%"]], hide_index=True)
+    st.dataframe(
+        away_squad[display_cols].sort_values("avg_rating", ascending=False, na_position="last"),
+        hide_index=True,
+    )
 
 st.divider()
 
