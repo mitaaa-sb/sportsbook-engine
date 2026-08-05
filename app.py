@@ -290,13 +290,19 @@ def _team_hist_side_stats(team_name: str, side: str, primary_df: pd.DataFrame,
 def calculate_historical_lambdas(
     home_team: str, away_team: str, hist_df: pd.DataFrame,
     secondary_df: Optional[pd.DataFrame] = None,
-) -> Tuple[float, float, dict, dict]:
+) -> Tuple[float, float, dict, dict, float, float]:
     """Calculates team attack/defense relative strength parameters from historical data.
-    Returns (lam_home, lam_away, home_info, away_info) — the info dicts expose
-    which tier of data actually backed each team's number, for UI diagnostics."""
+    Returns (lam_home, lam_away, home_info, away_info, league_home_avg, league_away_avg).
+    home_info/away_info now also carry "attack"/"defense" ratios (relative to
+    1.00 league average) alongside the raw goals — these are exactly the α/β
+    values shown in the Manual Rating Override panel, and the league_home_avg/
+    league_away_avg returned here are the SAME baseline used to compute them,
+    so an override can be recombined with `league_avg * attack * defense`
+    and get an answer consistent with the auto-computed one."""
     if hist_df.empty:
-        empty_info = {"goals_for": None, "goals_against": None, "tier": "no historical data", "n": 0}
-        return 1.55, 1.20, empty_info, empty_info
+        empty_info = {"goals_for": None, "goals_against": None, "attack": 1.0, "defense": 1.0,
+                       "tier": "no historical data", "n": 0}
+        return 1.55, 1.20, empty_info, empty_info, 1.55, 1.20
 
     league_home_avg_g = max(hist_df['FTHG'].mean(), 1.0)
     league_away_avg_g = max(hist_df['FTAG'].mean(), 1.0)
@@ -304,15 +310,16 @@ def calculate_historical_lambdas(
     home_info = _team_hist_side_stats(home_team, 'home', hist_df, secondary_df)
     away_info = _team_hist_side_stats(away_team, 'away', hist_df, secondary_df)
 
-    h_att = (home_info["goals_for"] / league_home_avg_g) if home_info["goals_for"] is not None else 1.0
-    h_def = (home_info["goals_against"] / league_away_avg_g) if home_info["goals_against"] is not None else 1.0
-    a_att = (away_info["goals_for"] / league_away_avg_g) if away_info["goals_for"] is not None else 1.0
-    a_def = (away_info["goals_against"] / league_home_avg_g) if away_info["goals_against"] is not None else 1.0
+    home_info["attack"] = round((home_info["goals_for"] / league_home_avg_g) if home_info["goals_for"] is not None else 1.0, 3)
+    home_info["defense"] = round((home_info["goals_against"] / league_away_avg_g) if home_info["goals_against"] is not None else 1.0, 3)
+    away_info["attack"] = round((away_info["goals_for"] / league_away_avg_g) if away_info["goals_for"] is not None else 1.0, 3)
+    away_info["defense"] = round((away_info["goals_against"] / league_home_avg_g) if away_info["goals_against"] is not None else 1.0, 3)
 
-    lam_home = league_home_avg_g * h_att * a_def
-    lam_away = league_away_avg_g * a_att * h_def
+    lam_home = league_home_avg_g * home_info["attack"] * away_info["defense"]
+    lam_away = league_away_avg_g * away_info["attack"] * home_info["defense"]
 
-    return round(float(lam_home), 3), round(float(lam_away), 3), home_info, away_info
+    return (round(float(lam_home), 3), round(float(lam_away), 3), home_info, away_info,
+            round(float(league_home_avg_g), 3), round(float(league_away_avg_g), 3))
 
 
 # ====================================================================================
@@ -701,8 +708,14 @@ def fetch_market_odds(home_team: str, away_team: str, league_name: str = "Premie
 # ====================================================================================
 # 5. QUANTITATIVE MODELING ENGINE
 # ====================================================================================
-def calculate_team_base_lambdas(home_team: str, away_team: str, team_stats: pd.DataFrame) -> Tuple[float, float]:
-    """Fallback lambda calculator from single-season standings data."""
+def calculate_team_base_lambdas(
+    home_team: str, away_team: str, team_stats: pd.DataFrame
+) -> Tuple[float, float, dict, dict, float, float]:
+    """Fallback lambda calculator from single-season standings data.
+    Returns the same shape as calculate_historical_lambdas — (lam_home,
+    lam_away, home_info, away_info, league_home_avg, league_away_avg) — so
+    the Manual Rating Override panel works identically regardless of which
+    data source actually produced the auto values."""
     league_home_avg = max(team_stats['home_xG_for'].mean(), 1.0)
     league_away_avg = max(team_stats['away_xG_for'].mean(), 1.0)
     
@@ -725,8 +738,22 @@ def calculate_team_base_lambdas(home_team: str, away_team: str, team_stats: pd.D
     
     base_lam_home = league_home_avg * home_att * away_def
     base_lam_away = league_away_avg * away_att * home_def
+
+    home_info = {
+        "goals_for": float(h_stat['home_xG_for'].values[0]) if not h_stat.empty else None,
+        "goals_against": float(h_stat['home_xG_against'].values[0]) if not h_stat.empty else None,
+        "attack": round(float(home_att), 3), "defense": round(float(home_def), 3),
+        "tier": "live standings" if not h_stat.empty else "no match — league average", "n": None,
+    }
+    away_info = {
+        "goals_for": float(a_stat['away_xG_for'].values[0]) if not a_stat.empty else None,
+        "goals_against": float(a_stat['away_xG_against'].values[0]) if not a_stat.empty else None,
+        "attack": round(float(away_att), 3), "defense": round(float(away_def), 3),
+        "tier": "live standings" if not a_stat.empty else "no match — league average", "n": None,
+    }
     
-    return round(base_lam_home, 3), round(base_lam_away, 3)
+    return (round(base_lam_home, 3), round(base_lam_away, 3), home_info, away_info,
+            round(float(league_home_avg), 3), round(float(league_away_avg), 3))
 
 
 def player_impact_score(squad: pd.DataFrame, active_mask: dict) -> Tuple[float, pd.DataFrame]:
@@ -944,17 +971,64 @@ secondary_hist_df = fetch_historical_league_data(secondary_code) if secondary_co
 # Diagnostics so a repeat of the mmz4235/mmz4281 URL bug — where the historical
 # engine failed 100% silently for weeks — can never hide again. Shown in the UI below.
 lambda_source = "mock"
-home_tier_info = away_tier_info = {"tier": "n/a", "n": 0}
+home_tier_info = away_tier_info = {"tier": "n/a", "n": 0, "attack": 1.0, "defense": 1.0,
+                                     "goals_for": None, "goals_against": None}
+league_home_avg_used = league_away_avg_used = 1.55
 
 if not hist_df.empty:
     lambda_source = f"historical CSV ({len(hist_df)} matches, {hist_code})"
-    base_lam_home, base_lam_away, home_tier_info, away_tier_info = calculate_historical_lambdas(
+    (base_lam_home, base_lam_away, home_tier_info, away_tier_info,
+     league_home_avg_used, league_away_avg_used) = calculate_historical_lambdas(
         home_team, away_team, hist_df, secondary_hist_df
     )
 else:
     season_stats = fetch_team_season_stats(league)
-    base_lam_home, base_lam_away = calculate_team_base_lambdas(home_team, away_team, season_stats)
+    (base_lam_home, base_lam_away, home_tier_info, away_tier_info,
+     league_home_avg_used, league_away_avg_used) = calculate_team_base_lambdas(
+        home_team, away_team, season_stats
+    )
     lambda_source = "live standings" if FOOTBALL_DATA_KEY else "mock season stats"
+
+# --- Manual Rating Override panel ---
+# Ports the "editable team rating sheet" idea from the quant-trader prompt
+# into the deterministic pipeline: pre-fills each team's AUTO-computed
+# attack/defense/xG (whatever source produced them above), lets you override
+# any of them, and recombines using the EXACT SAME formula the auto pipeline
+# uses (league_avg × attack × defense) — so an edit here stays consistent
+# with how every other match is priced, rather than becoming a disconnected
+# guess. Deliberately does NOT call an LLM to estimate these; that would
+# reintroduce the same hallucination risk we spent several rounds removing.
+st.sidebar.divider()
+st.sidebar.subheader("⚙️ Manual Rating Override")
+st.sidebar.caption("Pre-filled with the auto-computed values below. Override only if you have a reason the pipeline can't see yet — e.g. a transfer, a manager change, or a club with no usable historical match.")
+
+def _rating_override_ui(team_name: str, info: dict, key_prefix: str):
+    with st.sidebar.expander(f"{team_name} — {info['tier']}"):
+        override_on = st.checkbox(f"Override {team_name}'s rating", value=False, key=f"{key_prefix}_override_on")
+        attack_eff = st.number_input(
+            "Attack Rating (α, vs 1.00 league avg)", value=float(info["attack"]), step=0.01,
+            key=f"{key_prefix}_attack", disabled=not override_on,
+        )
+        defense_eff = st.number_input(
+            "Defense Rating (β, vs 1.00 league avg)", value=float(info["defense"]), step=0.01,
+            key=f"{key_prefix}_defense", disabled=not override_on,
+        )
+        overall = round(min(max(50 + (attack_eff - defense_eff) * 25, 0), 100), 1)
+        st.caption(f"Overall Power Rating (derived, read-only): **{overall}/100**")
+        gf = info.get("goals_for")
+        ga = info.get("goals_against")
+        st.caption(f"Auto xG profile — For: {gf:.2f} / Against: {ga:.2f}" if gf is not None and ga is not None
+                   else "Auto xG profile — unavailable for this team")
+        return override_on, attack_eff, defense_eff
+
+home_override_on, home_attack_eff, home_defense_eff = _rating_override_ui(home_team, home_tier_info, "home")
+away_override_on, away_attack_eff, away_defense_eff = _rating_override_ui(away_team, away_tier_info, "away")
+
+if home_override_on or away_override_on:
+    base_lam_home = round(league_home_avg_used * home_attack_eff * away_defense_eff, 3)
+    base_lam_away = round(league_away_avg_used * away_attack_eff * home_defense_eff, 3)
+    overridden = ", ".join(t for t, on in [(home_team, home_override_on), (away_team, away_override_on)] if on)
+    lambda_source += f" + manual override ({overridden})"
 
 home_form_df = fetch_team_form(home_team, league)
 away_form_df = fetch_team_form(away_team, league)
