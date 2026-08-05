@@ -53,6 +53,14 @@ LEAGUES = {
     "Ligue 1": "FL1",
 }
 
+HIST_LEAGUE_MAP = {
+    "Premier League": "E0",
+    "La Liga": "SP1",
+    "Serie A": "I1",
+    "Bundesliga": "D1",
+    "Ligue 1": "F1",
+}
+
 _STADIUM_CITIES = {
     "Premier League": ("London", 51.5072, -0.1276),
     "La Liga": ("Madrid", 40.4168, -3.7038),
@@ -61,9 +69,6 @@ _STADIUM_CITIES = {
     "Ligue 1": ("Paris", 48.8566, 2.3522),
 }
 
-# BUGFIX: fetch_market_odds previously hardcoded "soccer_epl" for every league.
-# The Odds API needs the correct sport key per competition or it silently
-# queries the wrong league's odds (and misses every non-EPL match).
 ODDS_API_SPORT_KEYS = {
     "Premier League": "soccer_epl",
     "La Liga": "soccer_spain_la_liga",
@@ -72,14 +77,6 @@ ODDS_API_SPORT_KEYS = {
     "Ligue 1": "soccer_france_ligue_one",
 }
 
-# Shared team pools per league — used by both mock fixtures AND mock season
-# stats so the two always stay in sync. Previously these were two separate
-# hardcoded lists (in _mock_fixtures and _mock_season_stats) that had drifted:
-# _mock_season_stats only covered 14 EPL/marquee teams while _mock_fixtures
-# pulled from ~30 teams across 5 leagues, so most non-EPL (and several EPL)
-# matchups silently fell back to a generic default lambda base instead of a
-# team-specific one. Defining the pool once and reusing it everywhere fixes
-# that gap and guarantees every fixture-eligible team has real mock stats.
 LEAGUE_TEAM_POOLS = {
     "Premier League": ["Arsenal", "Man City", "Liverpool", "Chelsea", "Aston Villa", "Tottenham"],
     "La Liga": ["Real Madrid", "Barcelona", "Atletico Madrid", "Real Sociedad", "Sevilla", "Villarreal"],
@@ -90,14 +87,67 @@ LEAGUE_TEAM_POOLS = {
 
 
 def _current_season_year() -> int:
-    """European football seasons span two calendar years; API-Football keys
-    stats by the year the season STARTED (e.g. 2025 for the 2025/26 season)."""
     now = dt.datetime.now()
     return now.year if now.month >= 7 else now.year - 1
 
 
 # ====================================================================================
-# 2. MOCK DATA GENERATORS (DEMO FALLBACKS)
+# 2. HISTORICAL DATA ENGINE (MULTI-SEASON ARCHIVE)
+# ====================================================================================
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_historical_league_data(league_code: str = "E0") -> pd.DataFrame:
+    """
+    Downloads multi-season match data, goals, and closing odds directly 
+    from Football-Data.co.uk CSVs without requiring an API key.
+    """
+    seasons = ["2324", "2425", "2526"]
+    dfs = []
+    
+    for s in seasons:
+        url = f"https://www.football-data.co.uk/mmz4235/{s}/{league_code}.csv"
+        try:
+            df = pd.read_csv(url)
+            cols = ['Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'HS', 'AS', 'HST', 'AST', 'B365H', 'B365D', 'B365A']
+            available_cols = [c for c in cols if c in df.columns]
+            df_clean = df[available_cols].dropna(subset=['HomeTeam', 'AwayTeam', 'FTHG', 'FTAG'])
+            dfs.append(df_clean)
+        except Exception:
+            continue
+
+    if dfs:
+        combined = pd.concat(dfs, ignore_index=True)
+        combined['Date'] = pd.to_datetime(combined['Date'], dayfirst=True, errors='coerce')
+        return combined.sort_values('Date', ascending=False)
+    
+    return pd.DataFrame()
+
+
+def calculate_historical_lambdas(home_team: str, away_team: str, hist_df: pd.DataFrame) -> Tuple[float, float]:
+    """Calculates team attack/defense relative strength parameters from historical data."""
+    if hist_df.empty:
+        return 1.55, 1.20
+
+    league_home_avg_g = max(hist_df['FTHG'].mean(), 1.0)
+    league_away_avg_g = max(hist_df['FTAG'].mean(), 1.0)
+
+    # Soft matching team names against historical CSV entries
+    home_matches = hist_df[hist_df['HomeTeam'].str.contains(home_team[:5], case=False, na=False)].head(38)
+    away_matches = hist_df[hist_df['AwayTeam'].str.contains(away_team[:5], case=False, na=False)].head(38)
+
+    h_att = (home_matches['FTHG'].mean() / league_home_avg_g) if not home_matches.empty else 1.0
+    h_def = (home_matches['FTAG'].mean() / league_away_avg_g) if not home_matches.empty else 1.0
+
+    a_att = (away_matches['FTAG'].mean() / league_away_avg_g) if not away_matches.empty else 1.0
+    a_def = (away_matches['FTHG'].mean() / league_home_avg_g) if not away_matches.empty else 1.0
+
+    lam_home = league_home_avg_g * h_att * a_def
+    lam_away = league_away_avg_g * a_att * h_def
+
+    return round(float(lam_home), 3), round(float(lam_away), 3)
+
+
+# ====================================================================================
+# 3. MOCK DATA GENERATORS (DEMO FALLBACKS)
 # ====================================================================================
 def _mock_fixtures(league: str) -> pd.DataFrame:
     random.seed(hash(league) % 1000)
@@ -184,7 +234,7 @@ def _mock_odds(home: str, away: str) -> dict:
     }
 
 # ====================================================================================
-# 3. LIVE DATA LAYER
+# 4. LIVE DATA LAYER
 # ====================================================================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_weather(lat: float, lon: float, kickoff: dt.datetime) -> dict:
@@ -232,28 +282,6 @@ def fetch_fixtures(league_name: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_team_season_stats(league_name: str) -> pd.DataFrame:
-    """
-    Team-level attack/defense inputs consumed by calculate_team_base_lambdas.
-
-    ROOT-CAUSE BUGFIX (this is why the model showed Arsenal at ~2.91 while
-    every bookmaker had them at ~1.16): this function previously returned
-    `_mock_season_stats(league_name)` UNCONDITIONALLY — there was no live
-    branch at all, regardless of whether FOOTBALL_DATA_KEY was configured.
-    That means every team's modelled attack/defense strength was random noise
-    (np.random.uniform per team) with zero relationship to their real quality.
-    The Odds API side of the app was showing real bookmaker consensus, but the
-    statistical model's own inputs were completely disconnected from reality
-    — so a big favorite could easily come out underpriced by the model purely
-    by chance of the random seed.
-
-    Now, when FOOTBALL_DATA_KEY is set, this pulls the LIVE competition
-    standings (home/away split) from football-data.org and derives goals-for
-    / goals-against per game as a real, direction-correct proxy for attack and
-    defense strength. Note: this is a goals-based proxy, not true xG — football-
-    data.org's free tier doesn't expose expected goals. If you want genuine xG
-    here, wire in soccerdata's Understat reader (see comment at the bottom of
-    this function) in place of the goals proxy.
-    """
     league_code = LEAGUES.get(league_name)
     if FOOTBALL_DATA_KEY:
         try:
@@ -274,7 +302,7 @@ def fetch_team_season_stats(league_name: str) -> pd.DataFrame:
                 for name in set(home_lookup) & set(away_lookup):
                     h, a = home_lookup[name], away_lookup[name]
                     if not h.get("playedGames") or not a.get("playedGames"):
-                        continue  # no matches played yet in that split — skip rather than divide by zero
+                        continue
                     rows.append({
                         "team": name,
                         "home_xG_for": round(h["goalsFor"] / h["playedGames"], 2),
@@ -286,33 +314,11 @@ def fetch_team_season_stats(league_name: str) -> pd.DataFrame:
                     return pd.DataFrame(rows)
         except Exception:
             pass
-        # --------------------------------------------------------------
-        # >>> TRUE xG FETCHER CONFIGURATION POINT <<<
-        # Replace/augment the block above with soccerdata's Understat reader
-        # for real expected-goals data instead of the goals-based proxy:
-        #   import soccerdata as sd
-        #   understat = sd.Understat(leagues=UNDERSTAT_LEAGUE_MAP[league_name], seasons=_current_season_year())
-        #   team_stats = understat.read_team_match_stats()  # has xG/xGA per match
-        # --------------------------------------------------------------
     return _mock_season_stats(league_name)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_squad(team_name: str, seed_offset: int = 0) -> pd.DataFrame:
-    """
-    Live squad + per-player season stats from API-Football.
-
-    BUGFIX: previously fetched the real squad list (names/positions) but then
-    assigned every player a FIXED constant xG90/xA90 purely from their
-    position (e.g. every midfielder got exactly 0.14/0.22) — so PIV could
-    never tell a star player apart from a benchwarmer in the same position,
-    and the "player impact" driving lambda wasn't actually reflecting who's
-    good. This now calls API-Football's `/players` endpoint (team + season)
-    to pull each player's real season goals/assists/minutes and derives
-    per-90 rates as a goals-based proxy for xG90/xA90 (API-Football's free
-    tier doesn't expose true xG — see the fetcher configuration comment
-    below for wiring in real xG via soccerdata/Understat instead).
-    """
     if API_FOOTBALL_KEY:
         try:
             headers = {"x-apisports-key": API_FOOTBALL_KEY}
@@ -328,18 +334,11 @@ def fetch_squad(team_name: str, seed_offset: int = 0) -> pd.DataFrame:
                 team_id = team_res[0]["team"]["id"]
                 season = _current_season_year()
                 pos_map = {"Goalkeeper": "GK", "Defender": "DF", "Midfielder": "MF", "Attacker": "FW"}
-                # Position-average fallback ONLY for players with 0 minutes
-                # logged yet this season (new signings, kids coming through) —
-                # not applied blanket to the whole squad like before.
                 fallback_xg90 = {"FW": 0.30, "MF": 0.10, "DF": 0.02, "GK": 0.0}
                 fallback_xa90 = {"FW": 0.15, "MF": 0.16, "DF": 0.03, "GK": 0.0}
 
                 rows, page, total_pages = [], 1, 1
-                while page <= total_pages and page <= 3:  # cap pages to respect free-tier rate limits
-                    # --------------------------------------------------------------
-                    # >>> PLAYER STAT FETCHER CONFIGURATION POINT <<<
-                    # This is the real live source for per-player season stats.
-                    # --------------------------------------------------------------
+                while page <= total_pages and page <= 3:
                     r_stats = requests.get(
                         f"https://{API_FOOTBALL_HOST}/players",
                         headers=headers, params={"team": team_id, "season": season, "page": page}, timeout=8,
@@ -383,29 +382,12 @@ def fetch_squad(team_name: str, seed_offset: int = 0) -> pd.DataFrame:
                     return pd.DataFrame(rows)
         except Exception:
             pass
-        # --------------------------------------------------------------
-        # >>> TRUE xG/xA FETCHER CONFIGURATION POINT <<<
-        # Replace the goals-based proxy above with real per-player xG/xA:
-        #   import soccerdata as sd
-        #   understat = sd.Understat(leagues=..., seasons=_current_season_year())
-        #   player_stats = understat.read_player_season_stats()
-        # --------------------------------------------------------------
 
     return _mock_squad(team_name, seed_offset)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_team_form(team_name: str, league_name: str = "Premier League") -> pd.DataFrame:
-    """
-    5-match rolling form (goals/xG-proxy for and against, most recent last).
-
-    BUGFIX: previously returned `_mock_form(team_name)` unconditionally, same
-    class of bug as fetch_team_season_stats above — a team's "recent form"
-    was pure random noise regardless of API keys. Now pulls the team's last
-    5 finished matches from football-data.org when FOOTBALL_DATA_KEY is set,
-    using actual goals for/against as the xG proxy (again: goals, not true
-    xG — see the fetcher configuration comment for wiring in real xG).
-    """
     league_code = LEAGUES.get(league_name)
     if FOOTBALL_DATA_KEY:
         try:
@@ -437,18 +419,12 @@ def fetch_team_form(team_name: str, league_name: str = "Premier League") -> pd.D
                     rows.append({
                         "matches_ago": len(matches) - idx,
                         "goals_for": gf, "goals_against": ga,
-                        "xG_for": gf, "xG_against": ga,  # goals-based proxy, not true xG
+                        "xG_for": gf, "xG_against": ga,
                     })
                 if len(rows) >= 3:
                     return pd.DataFrame(rows)
         except Exception:
             pass
-        # --------------------------------------------------------------
-        # >>> TRUE xG FORM FETCHER CONFIGURATION POINT <<<
-        # Replace the goals-based proxy above with soccerdata's Understat
-        # reader for genuine per-match xG/xGA:
-        #   understat.read_team_match_stats()  # then take last 5 rows
-        # --------------------------------------------------------------
     return _mock_form(team_name)
 
 
@@ -474,11 +450,10 @@ def fetch_market_odds(home_team: str, away_team: str, league_name: str = "Premie
     return _mock_odds(home_team, away_team)
 
 # ====================================================================================
-# 4. QUANTITATIVE MODELING ENGINE
+# 5. QUANTITATIVE MODELING ENGINE
 # ====================================================================================
-
 def calculate_team_base_lambdas(home_team: str, away_team: str, team_stats: pd.DataFrame) -> Tuple[float, float]:
-    """Calculates team-specific base xG expectations based on relative attack and defense parameters."""
+    """Fallback lambda calculator from single-season standings data."""
     league_home_avg = max(team_stats['home_xG_for'].mean(), 1.0)
     league_away_avg = max(team_stats['away_xG_for'].mean(), 1.0)
     
@@ -489,7 +464,7 @@ def calculate_team_base_lambdas(home_team: str, away_team: str, team_stats: pd.D
     away_def = (a_stat['away_xG_against'].values[0] if not a_stat.empty else 1.20) / league_home_avg
     
     away_att = (a_stat['away_xG_for'].values[0] if not a_stat.empty else 1.20) / league_away_avg
-    home_def = (h_stat['home_xG_against'].values[0] if not h_stat.empty else 1.55) / league_away_avg
+    home_def = (h_stat['home_xG_against'].values[0] if not h_stat.empty else 1.55) / league_home_avg
     
     base_lam_home = league_home_avg * home_att * away_def
     base_lam_away = league_away_avg * away_att * home_def
@@ -546,7 +521,6 @@ def weather_modifier(weather: dict) -> float:
 
 
 def rest_modifier(days_rest: int) -> float:
-    """Applies a penalty for short rest turnarounds."""
     if days_rest <= 2: return 0.93
     elif days_rest == 3: return 0.97
     return 1.00
@@ -587,9 +561,8 @@ def scoreline_matrix(lam_home: float, lam_away: float, max_goals: int = 7) -> np
     return matrix
 
 # ====================================================================================
-# 5. DEVIGGING & KELLY TRADING LAYER
+# 6. DEVIGGING & KELLY TRADING LAYER
 # ====================================================================================
-
 def fair_odds(prob: float) -> float:
     return round(1 / prob, 3) if prob > 1e-6 else float("inf")
 
@@ -600,17 +573,6 @@ def apply_margin(probs: dict, target_margin_pct: float) -> dict:
 
 
 def devig_proportional(home_o: float, draw_o: float, away_o: float) -> Optional[Tuple[float, float, float]]:
-    """
-    Removes bookmaker overround to find true fair market probabilities.
-
-    BUGFIX: previously returned (0.0, 0.0, 0.0) when any single price was
-    missing/invalid. Because these three values are computed ONCE and reused
-    across all three 1X2 rows, a single missing Draw price used to zero out
-    Home and Away's "fair market prob" too — inflating Edge (pp) to roughly
-    the full model probability and falsely tripping the VALUE signal on
-    outcomes whose prices were actually fine. Now returns None so the caller
-    can fall back to a per-market naive comparison instead of a corrupted one.
-    """
     if not all([home_o, draw_o, away_o]) or any(o <= 1.0 for o in [home_o, draw_o, away_o]):
         return None
     raw_h, raw_d, raw_a = 1 / home_o, 1 / draw_o, 1 / away_o
@@ -619,11 +581,6 @@ def devig_proportional(home_o: float, draw_o: float, away_o: float) -> Optional[
 
 
 def devig_two_way(odd_a: float, odd_b: float) -> Optional[Tuple[float, float]]:
-    """
-    Proportional devig for two-outcome markets (Over/Under 2.5, BTTS).
-    Replaces the previous hardcoded fair_mkt_prob=0.50 placeholder, which
-    ignored the actual bookmaker prices for these markets entirely.
-    """
     if not odd_a or not odd_b or odd_a <= 1.0 or odd_b <= 1.0:
         return None
     raw_a, raw_b = 1 / odd_a, 1 / odd_b
@@ -632,7 +589,6 @@ def devig_two_way(odd_a: float, odd_b: float) -> Optional[Tuple[float, float]]:
 
 
 def kelly_stake(model_prob: float, book_odds: float, fraction: float = 0.25) -> float:
-    """Calculates Fractional Kelly Criterion bankroll stake %."""
     if not book_odds or book_odds <= 1.0 or model_prob <= 0:
         return 0.0
     b = book_odds - 1.0
@@ -659,7 +615,7 @@ def derive_markets(matrix: np.ndarray) -> dict:
     }
 
 # ====================================================================================
-# 6. STREAMLIT SIDEBAR & INPUTS
+# 7. STREAMLIT SIDEBAR & INPUTS
 # ====================================================================================
 st.sidebar.title("⚽ Sportsbook Odds Engine")
 st.sidebar.caption("Quant Modeling & Devigged Edge Detection")
@@ -667,19 +623,17 @@ st.sidebar.caption("Quant Modeling & Devigged Edge Detection")
 if DEMO_MODE:
     st.sidebar.warning("⚠️ **DEMO MODE**: Set API keys in `st.secrets` for live feeds.")
 
-st.sidebar.subheader("API Connections")
+st.sidebar.subheader("API & Data Connections")
 st.sidebar.markdown(f"{'🟢' if API_FOOTBALL_KEY else '🔴'} API-Football")
 st.sidebar.markdown(f"{'🟢' if FOOTBALL_DATA_KEY else '🔴'} football-data.org")
 st.sidebar.markdown(f"{'🟢' if THE_ODDS_API_KEY else '🔴'} The Odds API")
+st.sidebar.markdown("🟢 Historical CSV Engine (Football-Data.co.uk)")
 st.sidebar.markdown("🟢 Open-Meteo Weather")
 
 if st.sidebar.button("🔄 Refresh Rosters & Live Stats", use_container_width=True):
-    # All fetch_* functions are @st.cache_data — this clears every cached
-    # response (fixtures, season stats, squads, form, odds, weather) so the
-    # next run pulls fresh data instead of a stale cached roster/injury list.
     st.cache_data.clear()
     st.rerun()
-st.sidebar.caption("Cached for 15–30 min per source. Use refresh after squad/injury news breaks.")
+st.sidebar.caption("Cached for 15–30 min per source. Historical data cached for 24 hours.")
 
 st.sidebar.divider()
 league = st.sidebar.selectbox("Select League", list(LEAGUES.keys()))
@@ -714,14 +668,21 @@ with st.sidebar.expander(f"🚗 {away_team} Lineup"):
     away_active = {row["player"]: st.checkbox(f"{row['player']} ({row['position']})", value=True, key=f"a_{row['player']}") for _, row in away_squad_raw.iterrows()}
 
 # ====================================================================================
-# 7. COMPUTATION & DATA PROCESSING
+# 8. COMPUTATION & DATA PROCESSING
 # ====================================================================================
 city, lat, lon = _STADIUM_CITIES.get(league, ("London", 51.5072, -0.1276))
 weather = fetch_weather(lat, lon, kickoff)
 w_mult = weather_modifier(weather)
 
-season_stats = fetch_team_season_stats(league)
-base_lam_home, base_lam_away = calculate_team_base_lambdas(home_team, away_team, season_stats)
+# Dual-layer Lambda Computation: Prefer multi-season historical CSV dataset, fallback to standings
+hist_code = HIST_LEAGUE_MAP.get(league, "E0")
+hist_df = fetch_historical_league_data(hist_code)
+
+if not hist_df.empty:
+    base_lam_home, base_lam_away = calculate_historical_lambdas(home_team, away_team, hist_df)
+else:
+    season_stats = fetch_team_season_stats(league)
+    base_lam_home, base_lam_away = calculate_team_base_lambdas(home_team, away_team, season_stats)
 
 home_form_df = fetch_team_form(home_team, league)
 away_form_df = fetch_team_form(away_team, league)
@@ -751,7 +712,7 @@ model_odds_totals = apply_margin({"over_2_5": model_probs["over_2_5"], "under_2_
 model_odds_btts = apply_margin({"btts_yes": model_probs["btts_yes"], "btts_no": model_probs["btts_no"]}, target_margin)
 
 # ====================================================================================
-# 8. DASHBOARD DISPLAY
+# 9. DASHBOARD DISPLAY
 # ====================================================================================
 st.title(f"{home_team} vs {away_team}")
 st.caption(f"{league} · Kickoff {kickoff.strftime('%A %d %B, %H:%M')} · Venue: {city}")
@@ -796,11 +757,6 @@ def build_trade_row(market_label, model_prob, model_odd, book_odd, fair_mkt_prob
     if not book_odd or book_odd <= 1.0:
         return {"Market": market_label, "Model Odds": model_odd, "Bookmaker Odds": "N/A", "Edge (pp)": 0, "Kelly Stake": "0.0%", "Signal": "N/A"}
 
-    # BUGFIX: when the devig couldn't run (missing/partial bookmaker prices),
-    # fair_mkt_prob arrives as None here instead of a silently-wrong 0.0.
-    # Fall back to the raw (non-devigged) implied probability of this specific
-    # price and flag the row so it's clear the margin wasn't removed — this
-    # avoids fabricating a huge false edge on markets whose own price is fine.
     devigged = True
     if fair_mkt_prob is None:
         fair_mkt_prob = 1 / book_odd
