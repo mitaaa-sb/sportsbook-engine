@@ -380,10 +380,21 @@ def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matche
         opp_att_list.append(opp_att)
         opp_def_list.append(opp_def)
 
+    # BUGFIX: recency weighting was lost when the rewrite replaced form_mult's
+    # weighted 5-match index with this scraper, which used a flat np.mean() —
+    # a match 4 days ago and one 5 weeks ago counted equally. Weight newest
+    # first, matching combined_matches' descending-date sort order.
+    weights = np.array([0.30, 0.25, 0.20, 0.15, 0.10])
+    if len(gf_list) < 5:
+        weights = weights[:len(gf_list)] / weights[:len(gf_list)].sum()
+
     return {
-        "gf": round(float(np.mean(gf_list)), 2), "xgf": round(float(np.mean(xgf_list)), 2),
-        "ga": round(float(np.mean(ga_list)), 2), "xga": round(float(np.mean(xga_list)), 2),
-        "opp_def": round(float(np.mean(opp_def_list)), 2), "opp_att": round(float(np.mean(opp_att_list)), 2),
+        "gf": round(float(np.average(gf_list, weights=weights)), 2),
+        "xgf": round(float(np.average(xgf_list, weights=weights)), 2),
+        "ga": round(float(np.average(ga_list, weights=weights)), 2),
+        "xga": round(float(np.average(xga_list, weights=weights)), 2),
+        "opp_def": round(float(np.average(opp_def_list, weights=weights)), 2),
+        "opp_att": round(float(np.average(opp_att_list, weights=weights)), 2),
     }
 
 # ====================================================================================
@@ -911,23 +922,19 @@ def player_impact_score(squad: pd.DataFrame, active_mask: dict) -> Tuple[float, 
     return round(piv_multiplier, 3), squad
 
 
-def form_multiplier(form_df: pd.DataFrame) -> float:
-    """
-    BUGFIX: this function and the "form_mult" it feeds were dropped entirely
-    from lambda_final in this rewrite, while the UI still displayed a
-    "Form: X/100" metric that now looked like it drove the prediction but
-    didn't. Restored so form actually affects λ again.
-    """
-    weights = np.array([0.10, 0.15, 0.20, 0.25, 0.30])
-    df = form_df.sort_values("matches_ago", ascending=False).reset_index(drop=True)
-    if len(df) < 5:
-        weights = weights[-len(df):] / weights[-len(df):].sum()
-    match_scores = 0.4 * df["goals_for"] + 0.6 * df["xG_for"]
-    weighted_score = float((match_scores * weights).sum())
-    return round(weighted_score / 1.45, 3)
-
-
 def team_form_rating_0_100(form_df: pd.DataFrame) -> float:
+    """
+    BUGFIX: form_multiplier/form_mult (a recency-weighted GF/xG-differential
+    signal from fetch_team_form's data) was restored to lambda_final in a
+    previous round to stop it silently being cosmetic-only. But now that
+    fetch_team_recent_xg_and_sos is properly recency-weighted (see above),
+    xg_att_reg_mult/xg_def_reg_mult_opponent measure the same underlying
+    "recent form" signal — better, since it's also opponent- and luck-
+    adjusted. Keeping both would double-count recent form twice from two
+    different sources. form_mult is removed again; this rating stays as a
+    DISPLAY-ONLY summary (labeled as such below), while the actual recent-
+    form adjustment to λ flows through the regression multipliers only.
+    """
     weights = np.array([0.10, 0.15, 0.20, 0.25, 0.30])
     df = form_df.sort_values("matches_ago", ascending=False).reset_index(drop=True)
     if len(df) < 5:
@@ -961,7 +968,6 @@ class TeamModelInputs:
     form_rating: float
     weather_mult: float
     rest_mult: float
-    form_mult: float = 1.0
     xg_att_reg_mult: float = 1.0
     xg_def_reg_mult_opponent: float = 1.0
     press_mult: float = 1.0
@@ -970,7 +976,8 @@ class TeamModelInputs:
 
     @property
     def lambda_final(self) -> float:
-        raw = self.base_lambda * self.piv_multiplier * self.weather_mult * self.rest_mult * self.form_mult * self.xg_att_reg_mult * self.xg_def_reg_mult_opponent * self.press_mult * self.travel_mult
+        # form_mult intentionally excluded — see team_form_rating_0_100 docstring.
+        raw = self.base_lambda * self.piv_multiplier * self.weather_mult * self.rest_mult * self.xg_att_reg_mult * self.xg_def_reg_mult_opponent * self.press_mult * self.travel_mult
         # BUGFIX: each new multiplier (regression, press, travel) was clamped
         # individually, but 7+ multiplicative terms can still compound far past
         # any single factor's bound (e.g. three factors at +30% each already
@@ -1141,15 +1148,25 @@ with st.sidebar.expander("1. xG Regression & Opponent Strength", expanded=False)
     a_true_xgf = a_xgf / a_opp_def if a_opp_def > 0 else a_xgf
     a_true_xga = a_xga / a_opp_att if a_opp_att > 0 else a_xga
 
-    h_att_reg_mult = ((h_true_xgf * 0.70) + (h_gf * 0.30)) / h_xgf if h_xgf > 0 else 1.0
-    h_def_reg_mult = ((h_true_xga * 0.70) + (h_ga * 0.30)) / h_xga if h_xga > 0 else 1.0
-    a_att_reg_mult = ((a_true_xgf * 0.70) + (a_gf * 0.30)) / a_xgf if a_xgf > 0 else 1.0
-    a_def_reg_mult = ((a_true_xga * 0.70) + (a_ga * 0.30)) / a_xga if a_xga > 0 else 1.0
+    # BUGFIX (Inverted Regression Math Bug): base_lambda is always built from
+    # ACTUAL GOALS in this app — historical CSV uses FTHG/FTAG directly, and
+    # the standings/mock fallback's "home_xG_for" columns are goals-per-game
+    # (goalsFor/playedGames from football-data.org, or a random proxy in mock)
+    # just labeled "xG" — there is no real-xG code path anywhere in this file.
+    # Dividing by h_xgf instead of h_gf meant a team that got lucky (gf=3.0,
+    # xgf=1.0) produced blended=1.6, then 1.6/xgf=1.6x — an UPWARD boost to a
+    # team that just overperformed its process quality, i.e. the model
+    # amplified luck instead of regressing away from it. Dividing by the
+    # actual recent goals (gf/ga) gives 1.6/3.0=0.53x — correctly discounts
+    # the lucky result back toward true quality. This must always use gf/ga,
+    # never a source-dependent choice, since no path here ever uses real xG.
+    h_att_reg_mult = ((h_true_xgf * 0.70) + (h_gf * 0.30)) / h_gf if h_gf > 0 else 1.0
+    h_def_reg_mult = ((h_true_xga * 0.70) + (h_ga * 0.30)) / h_ga if h_ga > 0 else 1.0
+    a_att_reg_mult = ((a_true_xgf * 0.70) + (a_gf * 0.30)) / a_gf if a_gf > 0 else 1.0
+    a_def_reg_mult = ((a_true_xga * 0.70) + (a_ga * 0.30)) / a_ga if a_ga > 0 else 1.0
 
-    # BUGFIX: these ratios divide by xGF/xGA, which can be tiny in a
-    # low-shot sample (verified: xGF=0.05 produced a 9.7x multiplier with no
-    # ceiling anywhere before it hit lambda). Clamped to a modest ±30% band —
-    # a regression/SoS adjustment should nudge the base rate, not swamp it.
+    # Safety clip (±30%): a regression/SoS adjustment should nudge the base
+    # rate, not swamp it, even with a noisy small-sample denominator.
     h_att_reg_mult = float(np.clip(h_att_reg_mult, 0.7, 1.3))
     h_def_reg_mult = float(np.clip(h_def_reg_mult, 0.7, 1.3))
     a_att_reg_mult = float(np.clip(a_att_reg_mult, 0.7, 1.3))
@@ -1297,7 +1314,6 @@ home_model = TeamModelInputs(
     name=home_team, base_lambda=base_lam_home, piv_multiplier=home_piv_mult,
     form_rating=team_form_rating_0_100(home_form_df),
     weather_mult=w_mult, rest_mult=rest_modifier(home_rest), 
-    form_mult=form_multiplier(home_form_df),
     xg_att_reg_mult=h_att_reg_mult, 
     xg_def_reg_mult_opponent=a_def_reg_mult,
     press_mult=h_press_mult, travel_mult=1.0, squad_table=home_squad,
@@ -1307,7 +1323,6 @@ away_model = TeamModelInputs(
     name=away_team, base_lambda=base_lam_away, piv_multiplier=away_piv_mult,
     form_rating=team_form_rating_0_100(away_form_df),
     weather_mult=w_mult, rest_mult=rest_modifier(away_rest), 
-    form_mult=form_multiplier(away_form_df),
     xg_att_reg_mult=a_att_reg_mult, 
     xg_def_reg_mult_opponent=h_def_reg_mult,
     press_mult=a_press_mult, travel_mult=away_travel_mult, squad_table=away_squad,
@@ -1355,13 +1370,14 @@ if "historical CSV" in lambda_source:
 c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.metric("λ Home (Final xG)", lam_home)
-    st.caption(f"Base {base_lam_home} → PIV×{home_piv_mult:.2f} · Form×{home_model.form_mult:.2f} · Reg×{h_att_reg_mult:.2f} (Att) / {a_def_reg_mult:.2f} (Opp Def) · Press×{h_press_mult:.2f}")
+    st.caption(f"Base {base_lam_home} → PIV×{home_piv_mult:.2f} · Reg×{h_att_reg_mult:.2f} (Att) / {a_def_reg_mult:.2f} (Opp Def) · Press×{h_press_mult:.2f}")
 with c2:
     st.metric("λ Away (Final xG)", lam_away)
-    st.caption(f"Base {base_lam_away} → PIV×{away_piv_mult:.2f} · Form×{away_model.form_mult:.2f} · Reg×{a_att_reg_mult:.2f} (Att) / {h_def_reg_mult:.2f} (Opp Def) · Trvl×{away_travel_mult:.2f}")
+    st.caption(f"Base {base_lam_away} → PIV×{away_piv_mult:.2f} · Reg×{a_att_reg_mult:.2f} (Att) / {h_def_reg_mult:.2f} (Opp Def) · Trvl×{away_travel_mult:.2f}")
 with c3:
     st.metric(f"{home_team} Form", f"{home_model.form_rating}/100")
     st.metric(f"{away_team} Form", f"{away_model.form_rating}/100")
+    st.caption("Informational only — recent-form effect on λ flows through the Reg× multipliers above, not this metric.")
 with c4:
     st.metric("🌡️ Temp", f"{weather['temperature_c']}°C")
     st.metric("💨 Wind", f"{weather['wind_speed_kmh']} km/h")
