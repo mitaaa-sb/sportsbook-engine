@@ -794,7 +794,15 @@ def fetch_market_odds(home_team: str, away_team: str, league_name: str = "Premie
                                 elif o["name"] == "Draw": h2h_prices["d"].append(o["price"])
                                 else: h2h_prices["a"].append(o["price"])
                         elif m["key"] == "totals":
+                            # BUGFIX: The Odds API's totals outcomes carry a "point"
+                            # field (the actual line, e.g. 2.5, 1.5, 3.5). Without
+                            # filtering to point==2.5, this was averaging prices from
+                            # DIFFERENT lines together — an "Over 3.5" price blended
+                            # with an "Over 2.5" price produces a meaningless number,
+                            # not a consensus. Only the 2.5 line matches our markets.
                             for o in m["outcomes"]:
+                                if o.get("point") != 2.5:
+                                    continue
                                 if o["name"] == "Over": ou_prices["o"].append(o["price"])
                                 elif o["name"] == "Under": ou_prices["u"].append(o["price"])
                         elif m["key"] == "btts":
@@ -962,7 +970,17 @@ class TeamModelInputs:
 
     @property
     def lambda_final(self) -> float:
-        val = self.base_lambda * self.piv_multiplier * self.weather_mult * self.rest_mult * self.form_mult * self.xg_att_reg_mult * self.xg_def_reg_mult_opponent * self.press_mult * self.travel_mult
+        raw = self.base_lambda * self.piv_multiplier * self.weather_mult * self.rest_mult * self.form_mult * self.xg_att_reg_mult * self.xg_def_reg_mult_opponent * self.press_mult * self.travel_mult
+        # BUGFIX: each new multiplier (regression, press, travel) was clamped
+        # individually, but 7+ multiplicative terms can still compound far past
+        # any single factor's bound (e.g. three factors at +30% each already
+        # compounds to +120%). This is very likely why model odds drifted from
+        # the simpler pre-rewrite version. Cap the COMBINED swing to within 2x
+        # of base_lambda either direction — a joint safety net on top of the
+        # individual ones, not a replacement for them.
+        combined_mult = (raw / self.base_lambda) if self.base_lambda > 0 else 1.0
+        combined_mult = max(0.5, min(2.0, combined_mult))
+        val = self.base_lambda * combined_mult
         return round(max(val, 0.05), 3)
 
 
