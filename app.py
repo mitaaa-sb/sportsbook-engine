@@ -3,7 +3,7 @@ import math
 import random
 import datetime as dt
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -53,6 +53,15 @@ LEAGUES = {
     "Ligue 1": "FL1",
 }
 
+# API-Football Competition IDs for filtering stats STRICTLY to League matches
+API_FOOTBALL_LEAGUE_IDS = {
+    "Premier League": 39,
+    "La Liga": 140,
+    "Serie A": 135,
+    "Bundesliga": 78,
+    "Ligue 1": 61,
+}
+
 HIST_LEAGUE_MAP = {
     "Premier League": "E0",
     "La Liga": "SP1",
@@ -77,7 +86,6 @@ SECOND_TIER_DISPLAY_NAMES = {
     "F2": "Ligue 2",
 }
 
-# Baseline League Discipline Stats (Avg Fouls and Cards per match)
 LEAGUE_DISCIPLINE_STATS = {
     "Premier League": {"avg_fouls": 21.5, "avg_cards": 4.1},
     "La Liga": {"avg_fouls": 25.5, "avg_cards": 5.2},
@@ -112,6 +120,67 @@ LEAGUE_TEAM_POOLS = {
     "Bundesliga": ["Bayern Munich", "Dortmund", "RB Leipzig", "Leverkusen", "Union Berlin", "Freiburg"],
     "Ligue 1": ["PSG", "Monaco", "Marseille", "Lyon", "Lille", "Nice"],
 }
+
+# ====================================================================================
+# UNIFIED TEAM NAME STANDARDIZATION ENGINE
+# ====================================================================================
+HIST_TEAM_ALIASES = {
+    "manchester city": "man city", "man city fc": "man city", "manchester city fc": "man city",
+    "manchester united": "man united", "man utd": "man united", "manchester united fc": "man united",
+    "newcastle united": "newcastle", "newcastle united fc": "newcastle",
+    "tottenham hotspur": "tottenham", "tottenham hotspur fc": "tottenham",
+    "wolverhampton wanderers": "wolves", "wolverhampton": "wolves", "wolves fc": "wolves",
+    "nottingham forest": "nott'm forest", "nottm forest": "nott'm forest", "nottingham forest fc": "nott'm forest",
+    "west ham united": "west ham", "west ham united fc": "west ham",
+    "brighton & hove albion": "brighton", "brighton and hove albion": "brighton", "brighton fc": "brighton",
+    "leicester city": "leicester", "leeds united": "leeds",
+    "afc bournemouth": "bournemouth", "bournemouth fc": "bournemouth",
+    "atletico madrid": "ath madrid", "atlético madrid": "ath madrid", "atlético de madrid": "ath madrid",
+    "athletic club": "ath bilbao", "athletic bilbao": "ath bilbao",
+    "real betis": "betis", "celta vigo": "celta", "deportivo alaves": "alaves", "rayo vallecano": "vallecano",
+    "ac milan": "milan", "internazionale": "inter", "inter milan": "inter", "hellas verona": "verona",
+    "borussia dortmund": "dortmund", "borussia monchengladbach": "m'gladbach", "borussia mönchengladbach": "m'gladbach",
+    "bayer leverkusen": "leverkusen", "eintracht frankfurt": "ein frankfurt",
+    "1899 hoffenheim": "hoffenheim", "hoffenheim": "hoffenheim",
+    "1. fc koln": "fc koln", "1. fc köln": "fc koln", "koln": "fc koln",
+    "paris saint germain": "paris sg", "paris saint-germain": "paris sg", "psg": "paris sg",
+    "saint-etienne": "st etienne", "as saint-etienne": "st etienne",
+    "olympique marseille": "marseille", "olympique lyonnais": "lyon",
+    "coventry city": "coventry",
+}
+
+def normalize_team_name(name: str) -> str:
+    """Strips suffixes/prefixes and maps name variants to a single canonical key."""
+    if not name:
+        return ""
+    n = name.strip()
+    
+    suffixes = [" Football Club", " FC", " CF", " AFC", " SC", " SV"]
+    prefixes = ["AFC ", "FC ", "CF ", "SC ", "SV "]
+    
+    for p in prefixes:
+        if n.startswith(p):
+            n = n[len(p):].strip()
+    for s in suffixes:
+        if n.endswith(s):
+            n = n[:-len(s)].strip()
+            
+    clean_key = n.lower().replace("-", " ").replace("'", "").strip()
+    return HIST_TEAM_ALIASES.get(clean_key, n).strip()
+
+def is_team_match(name1: str, name2: str) -> bool:
+    """Robust fuzzy/canonical match checking between two team name strings."""
+    if not name1 or not name2:
+        return False
+    norm1 = normalize_team_name(name1).casefold()
+    norm2 = normalize_team_name(name2).casefold()
+    
+    if norm1 == norm2:
+        return True
+    if len(norm1) > 3 and len(norm2) > 3:
+        if norm1 in norm2 or norm2 in norm1:
+            return True
+    return False
 
 
 def _current_season_year() -> int:
@@ -151,51 +220,12 @@ def fetch_historical_league_data(league_code: str = "E0") -> pd.DataFrame:
     return pd.DataFrame()
 
 
-HIST_TEAM_ALIASES = {
-    "Manchester City": "Man City", "Manchester United": "Man United", "Newcastle United": "Newcastle",
-    "Tottenham Hotspur": "Tottenham", "Wolverhampton Wanderers": "Wolves", "Nottingham Forest": "Nott'm Forest",
-    "West Ham United": "West Ham", "West Bromwich Albion": "West Brom", "Brighton & Hove Albion": "Brighton",
-    "Leicester City": "Leicester", "Leeds United": "Leeds", "AFC Bournemouth": "Bournemouth",
-    "Atletico Madrid": "Ath Madrid", "Atlético Madrid": "Ath Madrid", "Athletic Club": "Ath Bilbao",
-    "Athletic Bilbao": "Ath Bilbao", "Real Betis": "Betis", "Celta Vigo": "Celta",
-    "Deportivo Alaves": "Alaves", "Rayo Vallecano": "Vallecano", "AC Milan": "Milan",
-    "Internazionale": "Inter", "Inter Milan": "Inter", "Hellas Verona": "Verona",
-    "Borussia Dortmund": "Dortmund", "Borussia Monchengladbach": "M'gladbach", "Bayer Leverkusen": "Leverkusen",
-    "Eintracht Frankfurt": "Ein Frankfurt", "1899 Hoffenheim": "Hoffenheim", "1. FC Koln": "FC Koln",
-    "Paris Saint Germain": "Paris SG", "Paris Saint-Germain": "Paris SG", "Saint-Etienne": "St Etienne",
-    "AS Saint-Etienne": "St Etienne", "Olympique Marseille": "Marseille", "Olympique Lyonnais": "Lyon",
-    "Coventry City": "Coventry",
-}
-
-
-def _normalize_hist_team_name(name: str) -> str:
-    n = (name or "").strip()
-    for suffix in (" FC", " CF", " AFC", " Football Club"):
-        if n.endswith(suffix):
-            n = n[: -len(suffix)]
-            break
-    return HIST_TEAM_ALIASES.get(n, n).strip()
-
-
 def _match_hist_team_rows(hist_df: pd.DataFrame, column: str, team_name: str) -> pd.DataFrame:
-    target = _normalize_hist_team_name(team_name)
-    if not target:
+    if hist_df.empty or column not in hist_df.columns:
         return hist_df.iloc[0:0]
 
-    exact = hist_df[hist_df[column].str.casefold() == target.casefold()]
-    if not exact.empty:
-        return exact
-
-    candidates = hist_df[column].dropna().unique()
-    forward_hits = [c for c in candidates if target.casefold() in c.casefold()]
-    if len(forward_hits) == 1:
-        return hist_df[hist_df[column] == forward_hits[0]]
-
-    reverse_hits = [c for c in candidates if c.casefold() in target.casefold()]
-    if len(reverse_hits) == 1:
-        return hist_df[hist_df[column] == reverse_hits[0]]
-
-    return hist_df.iloc[0:0]
+    matches = hist_df[hist_df[column].apply(lambda c: is_team_match(str(c), team_name))]
+    return matches
 
 
 def _team_hist_side_stats(team_name: str, side: str, primary_df: pd.DataFrame,
@@ -267,7 +297,6 @@ def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matche
 
     league_h_g = max(hist_df['FTHG'].mean(), 1.0)
     league_a_g = max(hist_df['FTAG'].mean(), 1.0)
-    norm_name = _normalize_hist_team_name(team_name)
 
     home_m = _match_hist_team_rows(hist_df, 'HomeTeam', team_name)
     away_m = _match_hist_team_rows(hist_df, 'AwayTeam', team_name)
@@ -278,7 +307,7 @@ def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matche
     gf_list, ga_list, xgf_list, xga_list, opp_def_list, opp_att_list = [], [], [], [], [], []
 
     for _, row in combined_matches.iterrows():
-        is_home = _normalize_hist_team_name(row['HomeTeam']) == norm_name or norm_name in row['HomeTeam']
+        is_home = is_team_match(str(row['HomeTeam']), team_name)
         opp_name = row['AwayTeam'] if is_home else row['HomeTeam']
 
         gf = row['FTHG'] if is_home else row['FTAG']
@@ -490,14 +519,18 @@ def fetch_team_season_stats(league_name: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_player_recent_ratings(team_id: int, n_games: int = 5) -> dict:
+def fetch_player_recent_ratings(team_id: int, league_name: str = "Premier League", n_games: int = 5) -> dict:
     if not API_FOOTBALL_KEY:
         return {}
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
+    league_id = API_FOOTBALL_LEAGUE_IDS.get(league_name, 39)
     try:
+        # Filter fixtures strictly to current league matches
         r_fx = requests.get(
             f"https://{API_FOOTBALL_HOST}/fixtures",
-            headers=headers, params={"team": team_id, "last": n_games}, timeout=8,
+            headers=headers, 
+            params={"team": team_id, "league": league_id, "last": n_games}, 
+            timeout=8,
         )
         r_fx.raise_for_status()
         fixture_ids = [f["fixture"]["id"] for f in r_fx.json().get("response", [])]
@@ -572,12 +605,13 @@ def _parse_players_stats_page(response_items: list, pos_map: dict, recent_rating
     return rows
 
 
-def _fetch_players_stats_all_pages(team_id: int, season: int, headers: dict) -> list:
+def _fetch_players_stats_all_pages(team_id: int, season: int, league_id: int, headers: dict) -> list:
     items, page, total_pages = [], 1, 1
     while page <= total_pages and page <= 3:
+        params = {"team": team_id, "season": season, "league": league_id, "page": page}
         r_stats = requests.get(
             f"https://{API_FOOTBALL_HOST}/players",
-            headers=headers, params={"team": team_id, "season": season, "page": page}, timeout=8,
+            headers=headers, params=params, timeout=8,
         )
         r_stats.raise_for_status()
         payload = r_stats.json()
@@ -588,14 +622,15 @@ def _fetch_players_stats_all_pages(team_id: int, season: int, headers: dict) -> 
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_squad(team_name: str, seed_offset: int = 0, n_games: int = 5) -> pd.DataFrame:
+def fetch_squad(team_name: str, league_name: str = "Premier League", seed_offset: int = 0, n_games: int = 5) -> pd.DataFrame:
+    """Fetches squad player stats STRICTLY for current league matches."""
     if API_FOOTBALL_KEY:
         try:
             headers = {"x-apisports-key": API_FOOTBALL_KEY}
-            clean_name = team_name.replace(" FC", "").replace(" AFC", "").replace(" Football Club", "")
+            clean_search_name = normalize_team_name(team_name)
             r_team = requests.get(
                 f"https://{API_FOOTBALL_HOST}/teams",
-                headers=headers, params={"search": clean_name}, timeout=6,
+                headers=headers, params={"search": clean_search_name}, timeout=6,
             )
             r_team.raise_for_status()
             team_res = r_team.json().get("response", [])
@@ -603,18 +638,22 @@ def fetch_squad(team_name: str, seed_offset: int = 0, n_games: int = 5) -> pd.Da
             if team_res:
                 team_id = team_res[0]["team"]["id"]
                 season = _current_season_year()
+                league_id = API_FOOTBALL_LEAGUE_IDS.get(league_name, 39)
+                
                 pos_map = {"Goalkeeper": "GK", "Defender": "DF", "Midfielder": "MF", "Attacker": "FW"}
                 fallback_xg90 = {"FW": 0.30, "MF": 0.10, "DF": 0.02, "GK": 0.0}
                 fallback_xa90 = {"FW": 0.15, "MF": 0.16, "DF": 0.03, "GK": 0.0}
 
-                recent_ratings = fetch_player_recent_ratings(team_id, n_games)
+                # Fetch player ratings strictly for league games
+                recent_ratings = fetch_player_recent_ratings(team_id, league_name=league_name, n_games=n_games)
 
-                items = _fetch_players_stats_all_pages(team_id, season, headers)
-                data_source = f"API-Football player stats ({season} season)"
+                # Query player stats isolated by team, season AND league ID
+                items = _fetch_players_stats_all_pages(team_id, season, league_id, headers)
+                data_source = f"API-Football stats ({season} {league_name})"
 
                 if not items:
-                    items = _fetch_players_stats_all_pages(team_id, season - 1, headers)
-                    data_source = f"API-Football player stats ({season - 1} season — {season} not yet underway)"
+                    items = _fetch_players_stats_all_pages(team_id, season - 1, league_id, headers)
+                    data_source = f"API-Football stats ({season - 1} {league_name})"
 
                 rows = _parse_players_stats_page(items, pos_map, recent_ratings, fallback_xg90, fallback_xa90)
 
@@ -626,7 +665,7 @@ def fetch_squad(team_name: str, seed_offset: int = 0, n_games: int = 5) -> pd.Da
                     r_squad.raise_for_status()
                     squad_res = r_squad.json().get("response", [])
                     if squad_res and "players" in squad_res[0]:
-                        data_source = "API-Football roster (no season stats available yet)"
+                        data_source = f"API-Football roster ({league_name})"
                         for p in squad_res[0]["players"]:
                             pos = pos_map.get(p.get("position"), "MF")
                             name = p.get("name")
@@ -647,7 +686,7 @@ def fetch_squad(team_name: str, seed_offset: int = 0, n_games: int = 5) -> pd.Da
             pass
 
     df = _mock_squad(team_name, seed_offset, n_games)
-    df["data_source"] = "Mock (API-Football unavailable or team not found)"
+    df["data_source"] = f"Mock ({league_name} - API-Football unavailable)"
     return df
 
 
@@ -665,7 +704,7 @@ def fetch_team_form(team_name: str, league_name: str = "Premier League") -> pd.D
             total_table = next(
                 (s["table"] for s in r_std.json().get("standings", []) if s.get("type") == "TOTAL"), []
             )
-            team_id = next((row["team"]["id"] for row in total_table if row["team"]["name"] == team_name), None)
+            team_id = next((row["team"]["id"] for row in total_table if is_team_match(row["team"]["name"], team_name)), None)
 
             if team_id:
                 r_m = requests.get(
@@ -676,7 +715,7 @@ def fetch_team_form(team_name: str, league_name: str = "Premier League") -> pd.D
                 matches = r_m.json().get("matches", [])[-5:]
                 rows = []
                 for idx, m in enumerate(matches):
-                    is_home = m["homeTeam"]["name"] == team_name
+                    is_home = is_team_match(m["homeTeam"]["name"], team_name)
                     gf = m["score"]["fullTime"]["home"] if is_home else m["score"]["fullTime"]["away"]
                     ga = m["score"]["fullTime"]["away"] if is_home else m["score"]["fullTime"]["home"]
                     if gf is None or ga is None:
@@ -695,10 +734,6 @@ def fetch_team_form(team_name: str, league_name: str = "Premier League") -> pd.D
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_market_odds(home_team: str, away_team: str, league_name: str = "Premier League") -> dict:
-    """
-    Fetches odds from The Odds API and calculates the mathematical average 
-    (Consensus) across all available bookmakers.
-    """
     sport_key = ODDS_API_SPORT_KEYS.get(league_name, "soccer_epl")
     if not THE_ODDS_API_KEY: 
         return _mock_odds(home_team, away_team)
@@ -708,14 +743,14 @@ def fetch_market_odds(home_team: str, away_team: str, league_name: str = "Premie
         r.raise_for_status()
         events = r.json()
         for ev in events:
-            if home_team.lower() in ev["home_team"].lower() or ev["home_team"].lower() in home_team.lower():
+            if is_team_match(ev["home_team"], home_team) or is_team_match(ev["away_team"], away_team):
                 h2h_prices, ou_prices = {"h": [], "d": [], "a": []}, {"o": [], "u": []}
                 
                 for book in ev["bookmakers"]:
                     for m in book["markets"]:
                         if m["key"] == "h2h":
                             for o in m["outcomes"]:
-                                if o["name"] == ev["home_team"]: h2h_prices["h"].append(o["price"])
+                                if is_team_match(o["name"], ev["home_team"]): h2h_prices["h"].append(o["price"])
                                 elif o["name"] == "Draw": h2h_prices["d"].append(o["price"])
                                 else: h2h_prices["a"].append(o["price"])
                         elif m["key"] == "totals":
@@ -749,8 +784,8 @@ def calculate_team_base_lambdas(
     league_home_avg = max(team_stats['home_xG_for'].mean(), 1.0)
     league_away_avg = max(team_stats['away_xG_for'].mean(), 1.0)
     
-    h_stat = team_stats.loc[team_stats['team'] == home_team]
-    a_stat = team_stats.loc[team_stats['team'] == away_team]
+    h_stat = team_stats.loc[team_stats['team'].apply(lambda t: is_team_match(str(t), home_team))]
+    a_stat = team_stats.loc[team_stats['team'].apply(lambda t: is_team_match(str(t), away_team))]
     
     home_att = (h_stat['home_xG_for'].values[0] if not h_stat.empty else 1.55) / league_home_avg
     away_def = (a_stat['away_xG_against'].values[0] if not a_stat.empty else 1.20) / league_home_avg
@@ -797,7 +832,6 @@ def player_impact_score(squad: pd.DataFrame, active_mask: dict, is_facing_promot
     availability_ratio = active_piv / max(total_piv, 1e-6)
     piv_multiplier = 0.60 + 0.40 * availability_ratio
     
-    # Apply Tier Adjustments for Lineup Impact
     if is_facing_promoted:
         piv_multiplier *= 1.05
     elif is_promoted_team:
@@ -848,8 +882,6 @@ class TeamModelInputs:
 
     @property
     def lambda_final(self) -> float:
-        # Cross-pollination: xg_def_reg_mult_opponent is used because the OPPONENT'S 
-        # defensive vulnerability increases THIS team's final scoring expectation.
         val = self.base_lambda * self.piv_multiplier * self.weather_mult * self.rest_mult * self.xg_att_reg_mult * self.xg_def_reg_mult_opponent * self.press_mult * self.travel_mult
         return round(max(val, 0.05), 3)
 
@@ -955,7 +987,6 @@ match_row = fixtures_df.loc[fixtures_df["label"] == match_label].iloc[0]
 
 home_team, away_team, kickoff = match_row["home_team"], match_row["away_team"], match_row["kickoff"]
 
-# Fetch historical data EARLY so it can populate the advanced UI modifiers
 hist_code = HIST_LEAGUE_MAP.get(league, "E0")
 hist_df = fetch_historical_league_data(hist_code)
 secondary_code = HIST_SECONDARY_LEAGUE_MAP.get(hist_code)
@@ -1066,8 +1097,10 @@ rating_window = st.sidebar.slider(
     "Player Form Window (games)", 3, 5, 5,
     help="avg_rating below is each player's average rating over their last N matches."
 )
-home_squad_raw = fetch_squad(home_team, seed_offset=1, n_games=rating_window)
-away_squad_raw = fetch_squad(away_team, seed_offset=2, n_games=rating_window)
+
+# Fetch squad player stats STRICTLY filtered to current league games
+home_squad_raw = fetch_squad(home_team, league_name=league, seed_offset=1, n_games=rating_window)
+away_squad_raw = fetch_squad(away_team, league_name=league, seed_offset=2, n_games=rating_window)
 
 with st.sidebar.expander(f"🏠 {home_team} Lineup"):
     home_active = {row["player"]: st.checkbox(f"{row['player']} ({row['position']})", value=True, key=f"h_{row['player']}") for _, row in home_squad_raw.iterrows()}
@@ -1158,7 +1191,7 @@ home_model = TeamModelInputs(
     form_rating=team_form_rating_0_100(home_form_df),
     weather_mult=w_mult, rest_mult=rest_modifier(home_rest), 
     xg_att_reg_mult=h_att_reg_mult, 
-    xg_def_reg_mult_opponent=a_def_reg_mult, # Cross-pollinated defense multiplier
+    xg_def_reg_mult_opponent=a_def_reg_mult,
     press_mult=h_press_mult, travel_mult=1.0, squad_table=home_squad,
 )
 
@@ -1167,7 +1200,7 @@ away_model = TeamModelInputs(
     form_rating=team_form_rating_0_100(away_form_df),
     weather_mult=w_mult, rest_mult=rest_modifier(away_rest), 
     xg_att_reg_mult=a_att_reg_mult, 
-    xg_def_reg_mult_opponent=h_def_reg_mult, # Cross-pollinated defense multiplier
+    xg_def_reg_mult_opponent=h_def_reg_mult,
     press_mult=a_press_mult, travel_mult=away_travel_mult, squad_table=away_squad,
 )
 
@@ -1206,7 +1239,7 @@ with c4:
 
 st.divider()
 
-st.subheader("👥 Player Form & Impact Penalties")
+st.subheader("👥 Player Form & Impact Penalties (Current League Matches)")
 home_squad_source = home_squad["data_source"].iloc[0] if "data_source" in home_squad.columns and len(home_squad) else "unknown"
 away_squad_source = away_squad["data_source"].iloc[0] if "data_source" in away_squad.columns and len(away_squad) else "unknown"
 st.caption(f"Squad data source — {home_team}: **{home_squad_source}** · {away_team}: **{away_squad_source}**")
