@@ -785,15 +785,24 @@ def fetch_team_form(team_name: str, league_name: str = "Premier League") -> pd.D
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def _fetch_api_football_fixture_id(home_team: str, away_team: str, league_name: str) -> Optional[int]:
+def _fetch_api_football_fixture_id(home_team: str, away_team: str, league_name: str) -> Tuple[Optional[int], str]:
     """
     Finds API-Football's own fixture ID for this matchup. Needed because our
     fixture list comes from football-data.org, which uses a completely
     different ID scheme than API-Football — can't just reuse the id we
     already have.
+
+    BUGFIX: previously caught every exception silently and returned bare
+    None — if this fell to mock, there was no way to tell WHY (missing key?
+    rate limit? match just not in the lookup window?) without guessing.
+    Now returns (fixture_id, reason) so the caller can surface the real
+    cause. Also checks payload.get("errors") explicitly — API-Football has a
+    known quirk of returning HTTP 200 with a populated "errors" field (e.g.
+    quota exceeded) instead of a proper 4xx status, which raise_for_status()
+    would never catch.
     """
     if not API_FOOTBALL_KEY:
-        return None
+        return None, "no API_FOOTBALL_KEY configured"
     try:
         headers = {"x-apisports-key": API_FOOTBALL_KEY}
         league_id = API_FOOTBALL_LEAGUE_IDS.get(league_name, 39)
@@ -803,17 +812,23 @@ def _fetch_api_football_fixture_id(home_team: str, away_team: str, league_name: 
             timeout=8,
         )
         r.raise_for_status()
-        for f in r.json().get("response", []):
+        payload = r.json()
+        if payload.get("errors"):
+            return None, f"API-Football /fixtures error: {payload['errors']}"
+        for f in payload.get("response", []):
             h, a = f["teams"]["home"]["name"], f["teams"]["away"]["name"]
             if is_team_match(h, home_team) and is_team_match(a, away_team):
-                return f["fixture"]["id"]
-    except Exception:
-        pass
-    return None
+                return f["fixture"]["id"], "ok"
+        return None, "match not found in the next 30 league-wide fixtures (may be further out than that window covers)"
+    except requests.exceptions.HTTPError as e:
+        code = e.response.status_code if e.response is not None else "?"
+        return None, f"HTTP {code} from /fixtures" + (" (likely daily quota exhausted)" if code in (429, 401, 403) else "")
+    except Exception as e:
+        return None, f"/fixtures request failed: {type(e).__name__}"
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_api_football_odds(home_team: str, away_team: str, league_name: str = "Premier League") -> Optional[dict]:
+def fetch_api_football_odds(home_team: str, away_team: str, league_name: str = "Premier League") -> Tuple[Optional[dict], str]:
     """
     API-Football's own /odds endpoint — free fallback consensus source using
     the SAME key already configured for squads/players, no new signup.
@@ -822,12 +837,17 @@ def fetch_api_football_odds(home_team: str, away_team: str, league_name: str = "
     Per API-Football's own docs: odds typically appear 1-14 days before
     kickoff and refresh roughly every 3 hours — very far out or very last-
     minute, this may legitimately return nothing yet, which is not a bug.
+
+    BUGFIX: same as _fetch_api_football_fixture_id above — returns
+    (result, reason) instead of swallowing the failure reason silently, and
+    checks payload.get("errors") explicitly for the same HTTP-200-with-
+    errors-field quirk.
     """
     if not API_FOOTBALL_KEY:
-        return None
-    fixture_id = _fetch_api_football_fixture_id(home_team, away_team, league_name)
+        return None, "no API_FOOTBALL_KEY configured"
+    fixture_id, reason = _fetch_api_football_fixture_id(home_team, away_team, league_name)
     if not fixture_id:
-        return None
+        return None, f"fixture lookup failed ({reason})"
     try:
         headers = {"x-apisports-key": API_FOOTBALL_KEY}
         r = requests.get(
@@ -835,9 +855,12 @@ def fetch_api_football_odds(home_team: str, away_team: str, league_name: str = "
             headers=headers, params={"fixture": fixture_id}, timeout=8,
         )
         r.raise_for_status()
-        response = r.json().get("response", [])
+        payload = r.json()
+        if payload.get("errors"):
+            return None, f"API-Football /odds error: {payload['errors']}"
+        response = payload.get("response", [])
         if not response:
-            return None
+            return None, "no odds published yet for this fixture (normal if >14 days out or very stale)"
 
         home_p, draw_p, away_p = [], [], []
         over_p, under_p, btts_yes_p, btts_no_p = [], [], [], []
@@ -863,7 +886,7 @@ def fetch_api_football_odds(home_team: str, away_team: str, league_name: str = "
                         elif v["value"] == "No": btts_no_p.append(float(v["odd"]))
 
         if not home_p:
-            return None
+            return None, f"{len(bookmakers)} bookmaker(s) found but none listed a 'Match Winner' market"
 
         return {
             "1X2": {
@@ -876,21 +899,36 @@ def fetch_api_football_odds(home_team: str, away_team: str, league_name: str = "
             "btts_yes": round(float(np.mean(btts_yes_p)), 2) if btts_yes_p else None,
             "btts_no": round(float(np.mean(btts_no_p)), 2) if btts_no_p else None,
             "source": f"API-Football odds ({len(bookmakers)} bookmakers)",
-        }
-    except Exception:
-        return None
+        }, "ok"
+    except requests.exceptions.HTTPError as e:
+        code = e.response.status_code if e.response is not None else "?"
+        return None, f"HTTP {code} from /odds" + (" (likely daily quota exhausted)" if code in (429, 401, 403) else "")
+    except Exception as e:
+        return None, f"/odds request failed: {type(e).__name__}"
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_market_odds(home_team: str, away_team: str, league_name: str = "Premier League") -> dict:
+    """
+    BUGFIX: every fallback tier used to swallow its failure reason with a
+    bare `except: pass`, so when this fell all the way to mock, the "Odds
+    Source" caption just said "Mock Data Engine" with zero indication of
+    WHY — leaving you guessing between "no key", "rate limited", or "fixture
+    just not found" with no way to tell which. Now collects a reason from
+    each tier and attaches the full trail to the mock result's source label.
+    """
     sport_key = ODDS_API_SPORT_KEYS.get(league_name, "soccer_epl")
+    reasons = []
+
     if THE_ODDS_API_KEY:
         try:
             r = requests.get(f"{ODDS_API_BASE}/sports/{sport_key}/odds", params={"apiKey": THE_ODDS_API_KEY, "regions": "uk,eu", "markets": "h2h,totals,btts", "oddsFormat": "decimal"}, timeout=8)
             r.raise_for_status()
             events = r.json()
+            matched_event = False
             for ev in events:
                 if is_team_match(ev["home_team"], home_team) and is_team_match(ev["away_team"], away_team):
+                    matched_event = True
                     h2h_prices, ou_prices, btts_prices = {"h": [], "d": [], "a": []}, {"o": [], "u": []}, {"y": [], "n": []}
                     
                     for book in ev["bookmakers"]:
@@ -930,14 +968,23 @@ def fetch_market_odds(home_team: str, away_team: str, league_name: str = "Premie
                             "btts_no": round(np.mean(btts_prices["n"]), 2) if btts_prices["n"] else None,
                             "source": f"Consensus Average ({len(ev['bookmakers'])} Bookies)"
                         }
-        except Exception:
-            pass
+            reasons.append("The Odds API: matched event but no h2h prices" if matched_event else "The Odds API: fixture not found in current event list")
+        except requests.exceptions.HTTPError as e:
+            code = e.response.status_code if e.response is not None else "?"
+            reasons.append(f"The Odds API: HTTP {code}" + (" (quota/auth likely exhausted)" if code in (401, 429) else ""))
+        except Exception as e:
+            reasons.append(f"The Odds API: {type(e).__name__}")
+    else:
+        reasons.append("The Odds API: no key configured")
 
-    api_football_result = fetch_api_football_odds(home_team, away_team, league_name)
+    api_football_result, af_reason = fetch_api_football_odds(home_team, away_team, league_name)
     if api_football_result:
         return api_football_result
+    reasons.append(f"API-Football: {af_reason}")
 
-    return _mock_odds(home_team, away_team)
+    mock = _mock_odds(home_team, away_team)
+    mock["source"] = "Mock Data Engine — " + " | ".join(reasons)
+    return mock
 
 # ====================================================================================
 # 5. QUANTITATIVE MODELING ENGINE
