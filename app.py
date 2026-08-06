@@ -32,7 +32,6 @@ def get_secret(name: str) -> Optional[str]:
         pass
     return os.getenv(name)
 
-
 API_FOOTBALL_KEY = get_secret("API_FOOTBALL_KEY")
 FOOTBALL_DATA_KEY = get_secret("FOOTBALL_DATA_KEY")
 THE_ODDS_API_KEY = get_secret("THE_ODDS_API_KEY")
@@ -60,6 +59,9 @@ API_FOOTBALL_LEAGUE_IDS = {
     "Bundesliga": 78,
     "Ligue 1": 61,
 }
+
+# BUGFIX: Free plans do not have access to this season, try from 2022 to 2024.
+API_FOOTBALL_FREE_TIER_MAX_SEASON = 2024
 
 HIST_LEAGUE_MAP = {
     "Premier League": "E0",
@@ -149,11 +151,14 @@ HIST_TEAM_ALIASES = {
 }
 
 def normalize_team_name(name: str) -> str:
+    """Strips suffixes/prefixes and maps name variants to a single canonical key."""
     if not name:
         return ""
     n = name.strip()
+    
     suffixes = [" Football Club", " FC", " CF", " AFC", " SC", " SV"]
     prefixes = ["AFC ", "FC ", "CF ", "SC ", "SV "]
+    
     for p in prefixes:
         if n.startswith(p):
             n = n[len(p):].strip()
@@ -164,7 +169,9 @@ def normalize_team_name(name: str) -> str:
     clean_key = n.lower().replace("-", " ").replace("'", "").strip()
     return HIST_TEAM_ALIASES.get(clean_key, n).strip()
 
+
 def api_search_name(name: str) -> str:
+    """Strips suffixes/prefixes, with no alias remapping, for API-Football searches."""
     if not name:
         return ""
     n = name.strip()
@@ -177,6 +184,7 @@ def api_search_name(name: str) -> str:
     return n
 
 def is_team_match(name1: str, name2: str) -> bool:
+    """Robust fuzzy/canonical match checking between two team name strings."""
     if not name1 or not name2:
         return False
     norm1 = normalize_team_name(name1).casefold()
@@ -189,13 +197,16 @@ def is_team_match(name1: str, name2: str) -> bool:
             return True
     return False
 
+
 def _current_season_year() -> int:
     now = dt.datetime.now()
     return now.year if now.month >= 7 else now.year - 1
 
+
 def _recent_hist_season_codes(n: int = 3) -> list:
     start_year = _current_season_year()
     return [f"{str(y)[-2:]}{str(y + 1)[-2:]}" for y in range(start_year - n + 1, start_year + 1)]
+
 
 # ====================================================================================
 # 2. HISTORICAL DATA ENGINE (MULTI-SEASON ARCHIVE)
@@ -204,6 +215,7 @@ def _recent_hist_season_codes(n: int = 3) -> list:
 def fetch_historical_league_data(league_code: str = "E0") -> pd.DataFrame:
     seasons = _recent_hist_season_codes(3)
     dfs = []
+    
     for s in seasons:
         url = f"https://www.football-data.co.uk/mmz4281/{s}/{league_code}.csv"
         try:
@@ -214,27 +226,37 @@ def fetch_historical_league_data(league_code: str = "E0") -> pd.DataFrame:
             dfs.append(df_clean)
         except Exception:
             continue
+
     if dfs:
         combined = pd.concat(dfs, ignore_index=True)
         combined['Date'] = pd.to_datetime(combined['Date'], dayfirst=True, errors='coerce')
         return combined.sort_values('Date', ascending=False)
+    
     return pd.DataFrame()
+
 
 def _match_hist_team_rows(hist_df: pd.DataFrame, column: str, team_name: str) -> pd.DataFrame:
     if hist_df.empty or column not in hist_df.columns:
         return hist_df.iloc[0:0]
+
     target_norm = normalize_team_name(team_name).casefold()
     col = hist_df[column].astype(str)
+
     exact = hist_df[col.apply(lambda c: normalize_team_name(c).casefold() == target_norm)]
     if not exact.empty:
         return exact
+
     candidates = col.unique()
     hits = [c for c in candidates if is_team_match(c, team_name)]
     if len(hits) == 1:
         return hist_df[col == hits[0]]
+
     return hist_df.iloc[0:0]
 
-def _team_hist_side_stats(team_name: str, side: str, primary_df: pd.DataFrame, secondary_df: Optional[pd.DataFrame], league_home_avg_g: float, league_away_avg_g: float) -> dict:
+
+def _team_hist_side_stats(team_name: str, side: str, primary_df: pd.DataFrame,
+                           secondary_df: Optional[pd.DataFrame],
+                           league_home_avg_g: float, league_away_avg_g: float) -> dict:
     team_col = 'HomeTeam' if side == 'home' else 'AwayTeam'
     for_col = 'FTHG' if side == 'home' else 'FTAG'
     against_col = 'FTAG' if side == 'home' else 'FTHG'
@@ -272,8 +294,13 @@ def _team_hist_side_stats(team_name: str, side: str, primary_df: pd.DataFrame, s
             "tier": "no match — league average", "n": 0,
             "raw_attack": None, "raw_defense": None, "raw_goals_for": None, "raw_goals_against": None}
 
-def calculate_historical_lambdas(home_team: str, away_team: str, hist_df: pd.DataFrame, secondary_df: Optional[pd.DataFrame] = None) -> Tuple[float, float, dict, dict, float, float]:
-    empty_keys = {"attack": 1.0, "defense": 1.0, "raw_attack": None, "raw_defense": None, "raw_goals_for": None, "raw_goals_against": None, "goals_for": None, "goals_against": None}
+
+def calculate_historical_lambdas(
+    home_team: str, away_team: str, hist_df: pd.DataFrame,
+    secondary_df: Optional[pd.DataFrame] = None,
+) -> Tuple[float, float, dict, dict, float, float]:
+    empty_keys = {"attack": 1.0, "defense": 1.0, "raw_attack": None, "raw_defense": None,
+                  "raw_goals_for": None, "raw_goals_against": None, "goals_for": None, "goals_against": None}
     if hist_df.empty:
         empty_info = {**empty_keys, "tier": "no historical data", "n": 0}
         return 1.55, 1.20, empty_info, empty_info, 1.55, 1.20
@@ -287,7 +314,8 @@ def calculate_historical_lambdas(home_team: str, away_team: str, hist_df: pd.Dat
     lam_home = league_home_avg_g * home_info["attack"] * away_info["defense"]
     lam_away = league_away_avg_g * away_info["attack"] * home_info["defense"]
 
-    return (round(float(lam_home), 3), round(float(lam_away), 3), home_info, away_info, round(float(league_home_avg_g), 3), round(float(league_away_avg_g), 3))
+    return (round(float(lam_home), 3), round(float(lam_away), 3), home_info, away_info,
+            round(float(league_home_avg_g), 3), round(float(league_away_avg_g), 3))
 
 def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matches: int = 5) -> dict:
     default_res = {"gf": 1.5, "xgf": 1.5, "ga": 1.2, "xga": 1.2, "opp_def": 1.00, "opp_att": 1.00, "season_gf": 1.5, "season_ga": 1.5}
@@ -296,7 +324,6 @@ def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matche
     league_h_g = max(hist_df['FTHG'].mean(), 1.0)
     league_a_g = max(hist_df['FTAG'].mean(), 1.0)
 
-    # 1. LONG-TERM SEASON AVERAGES (Baseline for regression scaling)
     home_all = _match_hist_team_rows(hist_df, 'HomeTeam', team_name).head(38)
     away_all = _match_hist_team_rows(hist_df, 'AwayTeam', team_name).head(38)
     
@@ -311,7 +338,699 @@ def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matche
     season_gf = round(float(np.mean(gf_all)), 2) if gf_all else league_h_g
     season_ga = round(float(np.mean(ga_all)), 2) if ga_all else league_a_g
 
-    # 2. RECENT FORM STATS
+    home_m = _match_hist_team_rows(hist_df, 'HomeTeam', team_name)
+    away_m = _match_hist_team_rows(hist_df, 'AwayTeam', team_name)
+    combined_matches = pd.concat([home_m, away_m]).sort_values('Date', ascending=False).head(n_matches)
+    
+    if combined_matches.empty: 
+        default_res["season_gf"] = season_gf
+        default_res["season_ga"] = season_ga
+        return default_res
+
+    gf_list, ga_list, xgf_list, xga_list, opp_def_list, opp_att_list = [], [], [], [], [], []
+
+    for _, row in combined_matches.iterrows():
+        is_home = is_team_match(str(row['HomeTeam']), team_name)
+        opp_name = row['AwayTeam'] if is_home else row['HomeTeam']
+
+        gf = row['FTHG'] if is_home else row['FTAG']
+        ga = row['FTAG'] if is_home else row['FTHG']
+        gf_list.append(gf)
+        ga_list.append(ga)
+
+        hs = row['HS'] if not pd.isna(row.get('HS')) else 10.0
+        as_ = row['AS'] if not pd.isna(row.get('AS')) else 10.0
+        hst = row['HST'] if not pd.isna(row.get('HST')) else 3.5
+        ast = row['AST'] if not pd.isna(row.get('AST')) else 3.5
+
+        xg_home = 0.32 * hst + 0.03 * max(0, hs - hst)
+        xg_away = 0.32 * ast + 0.03 * max(0, as_ - ast)
+
+        xgf_list.append(xg_home if is_home else xg_away)
+        xga_list.append(xg_away if is_home else xg_home)
+
+        opp_home_rows = _match_hist_team_rows(hist_df, 'HomeTeam', opp_name).head(38)
+        opp_away_rows = _match_hist_team_rows(hist_df, 'AwayTeam', opp_name).head(38)
+        
+        opp_gf_h = opp_home_rows['FTHG'].mean() if not opp_home_rows.empty else league_h_g
+        opp_ga_h = opp_home_rows['FTAG'].mean() if not opp_home_rows.empty else league_a_g
+        opp_gf_a = opp_away_rows['FTAG'].mean() if not opp_away_rows.empty else league_a_g
+        opp_ga_a = opp_away_rows['FTHG'].mean() if not opp_away_rows.empty else league_h_g
+
+        opp_att = ((opp_gf_h + opp_gf_a) / 2.0) / ((league_h_g + league_a_g) / 2.0)
+        opp_def = ((opp_ga_h + opp_ga_a) / 2.0) / ((league_h_g + league_a_g) / 2.0)
+
+        opp_att_list.append(opp_att)
+        opp_def_list.append(opp_def)
+
+    weights = np.array([0.30, 0.25, 0.20, 0.15, 0.10])
+    if len(gf_list) < 5:
+        weights = weights[:len(gf_list)] / weights[:len(gf_list)].sum()
+
+    return {
+        "gf": round(float(np.average(gf_list, weights=weights)), 2),
+        "xgf": round(float(np.average(xgf_list, weights=weights)), 2),
+        "ga": round(float(np.average(ga_list, weights=weights)), 2),
+        "xga": round(float(np.average(xga_list, weights=weights)), 2),
+        "opp_def": round(float(np.average(opp_def_list, weights=weights)), 2),
+        "opp_att": round(float(np.average(opp_att_list, weights=weights)), 2),
+        "season_gf": season_gf,
+        "season_ga": season_ga
+    }
+
+# ====================================================================================
+# 3. MOCK DATA GENERATORS (DEMO FALLBACKS)
+# ====================================================================================
+def _mock_fixtures(league: str) -> pd.DataFrame:
+    random.seed(hash(league) % 1000)
+    teams = LEAGUE_TEAM_POOLS.get(league, LEAGUE_TEAM_POOLS["Premier League"]).copy()
+    fixtures = []
+    base_date = dt.datetime.now() + dt.timedelta(days=2)
+    random.shuffle(teams)
+    for i in range(0, len(teams) - 1, 2):
+        fixtures.append({
+            "fixture_id": f"{league[:2].upper()}{i}",
+            "home_team": teams[i],
+            "away_team": teams[i + 1],
+            "kickoff": (base_date + dt.timedelta(hours=3 * i)).replace(minute=0, second=0, microsecond=0),
+        })
+    return pd.DataFrame(fixtures)
+
+
+def _mock_season_stats(league: str) -> pd.DataFrame:
+    random.seed(hash(league) % 2000)
+    teams = LEAGUE_TEAM_POOLS.get(league, LEAGUE_TEAM_POOLS["Premier League"])
+    data = []
+    for t in teams:
+        data.append({
+            "team": t,
+            "home_xG_for": round(random.uniform(1.3, 2.3), 2),
+            "home_xG_against": round(random.uniform(0.7, 1.5), 2),
+            "away_xG_for": round(random.uniform(1.0, 1.9), 2),
+            "away_xG_against": round(random.uniform(0.9, 1.8), 2),
+        })
+    return pd.DataFrame(data)
+
+
+def _mock_squad(team: str, seed_offset: int = 0, n_games: int = 5) -> pd.DataFrame:
+    random.seed((hash(team) + seed_offset) % 10000)
+    positions = ["GK", "DF", "DF", "DF", "DF", "MF", "MF", "MF", "FW", "FW", "FW"]
+    names_pool = ["Silva", "Rodrigues", "Kovac", "Muller", "Dubois", "Novak", "Andersen", "Fernandez", "Costa", "Brandt", "Diaz"]
+    rows = []
+    for i, pos in enumerate(positions):
+        name = f"{random.choice(names_pool)} {chr(65 + i)}"
+        minutes = random.randint(600, 2500)
+        xg90 = round(max(0, np.random.normal(0.38 if pos == "FW" else 0.12 if pos == "MF" else 0.02, 0.10)), 3)
+        xa90 = round(max(0, np.random.normal(0.22 if pos in ("FW", "MF") else 0.03, 0.08)), 3)
+        games_rated = min(n_games, max(0, n_games - random.choice([0, 0, 0, 1, 2, n_games])))
+        rating = round(np.random.normal(7.0, 0.5), 2) if games_rated > 0 else 6.8
+        key_passes90 = round(max(0, np.random.normal(1.5 if pos == "MF" else 0.6, 0.5)), 2)
+        rows.append({
+            "player": name, "position": pos, "minutes": minutes,
+            "xG90": xg90, "xA90": xa90, "key_passes90": key_passes90,
+            "avg_rating": rating, "games_rated": games_rated, "status": "Active",
+        })
+    return pd.DataFrame(rows)
+
+
+def _mock_form(team: str) -> pd.DataFrame:
+    random.seed(hash(team) % 5000)
+    rows = []
+    for m in range(5, 0, -1):
+        rows.append({
+            "matches_ago": m,
+            "goals_for": np.random.poisson(1.5),
+            "goals_against": np.random.poisson(1.1),
+            "xG_for": round(max(0.2, np.random.normal(1.5, 0.4)), 2),
+            "xG_against": round(max(0.2, np.random.normal(1.1, 0.3)), 2),
+        })
+    return pd.DataFrame(rows)
+
+
+def _mock_odds(home: str, away: str) -> dict:
+    random.seed(hash(home + away) % 9999)
+    home_p = random.uniform(0.35, 0.55)
+    draw_p = random.uniform(0.22, 0.28)
+    away_p = 1.0 - home_p - draw_p
+    margin = 1.055
+    return {
+        "1X2": {
+            "home": round(1 / (home_p * margin), 2),
+            "draw": round(1 / (draw_p * margin), 2),
+            "away": round(1 / (away_p * margin), 2),
+        },
+        "over_2_5": round(1 / (0.52 * margin), 2),
+        "under_2_5": round(1 / (0.48 * margin), 2),
+        "btts_yes": round(1 / (0.53 * margin), 2),
+        "btts_no": round(1 / (0.47 * margin), 2),
+        "source": "Mock Data Engine"
+    }
+
+# ====================================================================================
+# 4. LIVE DATA LAYER
+# ====================================================================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_weather(lat: float, lon: float, kickoff: dt.datetime) -> dict:
+    try:
+        params = {
+            "latitude": lat, "longitude": lon,
+            "hourly": "temperature_2m,precipitation,wind_speed_10m",
+            "forecast_days": 7, "timezone": "auto",
+        }
+        r = requests.get(OPEN_METEO_BASE, params=params, timeout=6)
+        r.raise_for_status()
+        data = r.json()
+        hourly_times = data["hourly"]["time"]
+        target = kickoff.strftime("%Y-%m-%dT%H:00")
+        idx = hourly_times.index(target) if target in hourly_times else 0
+        return {
+            "temperature_c": data["hourly"]["temperature_2m"][idx],
+            "precipitation_mm": data["hourly"]["precipitation"][idx],
+            "wind_speed_kmh": data["hourly"]["wind_speed_10m"][idx],
+            "source": "Open-Meteo API",
+        }
+    except Exception:
+        return {"temperature_c": 14.5, "precipitation_mm": 0.0, "wind_speed_kmh": 12.0, "source": "Mock Weather"}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_fixtures(league_name: str) -> pd.DataFrame:
+    league_code = LEAGUES.get(league_name)
+    if FOOTBALL_DATA_KEY:
+        try:
+            headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
+            r = requests.get(f"{FOOTBALL_DATA_BASE}/competitions/{league_code}/matches", headers=headers, params={"status": "SCHEDULED"}, timeout=6)
+            r.raise_for_status()
+            matches = r.json().get("matches", [])[:8]
+            rows = [{
+                "fixture_id": m["id"], "home_team": m["homeTeam"]["name"], "away_team": m["awayTeam"]["name"],
+                "kickoff": dt.datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00")),
+            } for m in matches]
+            if rows:
+                return pd.DataFrame(rows)
+        except Exception:
+            pass
+    return _mock_fixtures(league_name)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_team_season_stats(league_name: str) -> pd.DataFrame:
+    league_code = LEAGUES.get(league_name)
+    if FOOTBALL_DATA_KEY:
+        try:
+            headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
+            r = requests.get(
+                f"{FOOTBALL_DATA_BASE}/competitions/{league_code}/standings",
+                headers=headers, timeout=8,
+            )
+            r.raise_for_status()
+            standings = r.json().get("standings", [])
+            home_table = next((s["table"] for s in standings if s.get("type") == "HOME"), None)
+            away_table = next((s["table"] for s in standings if s.get("type") == "AWAY"), None)
+
+            if home_table and away_table:
+                home_lookup = {row["team"]["name"]: row for row in home_table}
+                away_lookup = {row["team"]["name"]: row for row in away_table}
+                rows = []
+                for name in set(home_lookup) & set(away_lookup):
+                    h, a = home_lookup[name], away_lookup[name]
+                    if not h.get("playedGames") or not a.get("playedGames"):
+                        continue
+                    rows.append({
+                        "team": name,
+                        "home_xG_for": round(h["goalsFor"] / h["playedGames"], 2),
+                        "home_xG_against": round(h["goalsAgainst"] / h["playedGames"], 2),
+                        "away_xG_for": round(a["goalsFor"] / a["playedGames"], 2),
+                        "away_xG_against": round(a["goalsAgainst"] / a["playedGames"], 2),
+                    })
+                if rows:
+                    return pd.DataFrame(rows)
+        except Exception:
+            pass
+    return _mock_season_stats(league_name)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_player_recent_ratings(team_id: int, league_name: str = "Premier League", n_games: int = 5) -> dict:
+    if not API_FOOTBALL_KEY:
+        return {}
+    headers = {"x-apisports-key": API_FOOTBALL_KEY}
+    league_id = API_FOOTBALL_LEAGUE_IDS.get(league_name, 39)
+    try:
+        r_fx = requests.get(
+            f"https://{API_FOOTBALL_HOST}/fixtures",
+            headers=headers, 
+            params={"team": team_id, "league": league_id, "last": n_games}, 
+            timeout=8,
+        )
+        r_fx.raise_for_status()
+        fixture_ids = [f["fixture"]["id"] for f in r_fx.json().get("response", [])]
+
+        ratings: dict = {}
+        for fid in fixture_ids:
+            r_pl = requests.get(
+                f"https://{API_FOOTBALL_HOST}/fixtures/players",
+                headers=headers, params={"fixture": fid}, timeout=8,
+            )
+            r_pl.raise_for_status()
+            for team_block in r_pl.json().get("response", []):
+                if team_block.get("team", {}).get("id") != team_id:
+                    continue
+                for p in team_block.get("players", []):
+                    name = p.get("player", {}).get("name")
+                    stat = (p.get("statistics") or [{}])[0]
+                    games = stat.get("games", {}) or {}
+                    rating_raw = games.get("rating")
+                    minutes = games.get("minutes")
+                    if name and rating_raw and minutes:
+                        ratings.setdefault(name, []).append(float(rating_raw))
+
+        return {
+            name: {"avg_rating": round(sum(vals) / len(vals), 2), "games_rated": len(vals)}
+            for name, vals in ratings.items()
+        }
+    except Exception:
+        return {}
+
+
+def _parse_players_stats_page(response_items: list, pos_map: dict, recent_ratings: dict,
+                               fallback_xg90: dict, fallback_xa90: dict) -> list:
+    rows = []
+    for p in response_items:
+        info = p.get("player", {})
+        stat = (p.get("statistics") or [{}])[0]
+        games = stat.get("games", {}) or {}
+        goals = stat.get("goals", {}) or {}
+        minutes = games.get("minutes") or 0
+        pos = pos_map.get(games.get("position"), "MF")
+        goals_total = goals.get("total") or 0
+        assists_total = goals.get("assists") or 0
+        name = info.get("name")
+
+        season_rating_raw = games.get("rating")
+        recent = recent_ratings.get(name)
+        
+        if recent and recent["games_rated"] > 0:
+            rating = recent["avg_rating"]
+            games_rated = recent["games_rated"]
+        elif season_rating_raw:
+            rating = round(float(season_rating_raw), 2)
+            games_rated = 0
+        else:
+            rating = 6.8
+            games_rated = 0
+
+        if minutes and minutes > 0:
+            xg90 = round(goals_total / minutes * 90, 3)
+            xa90 = round(assists_total / minutes * 90, 3)
+        else:
+            xg90 = fallback_xg90.get(pos, 0.08)
+            xa90 = fallback_xa90.get(pos, 0.05)
+
+        rows.append({
+            "player": name, "position": pos, "minutes": minutes,
+            "xG90": xg90, "xA90": xa90,
+            "key_passes90": round(assists_total / max(minutes, 1) * 90 * 1.8, 2),
+            "avg_rating": rating, "games_rated": games_rated, "status": "Active",
+        })
+    return rows
+
+
+def _fetch_players_stats_all_pages(team_id: int, season: int, league_id: int, headers: dict) -> Tuple[list, bool]:
+    items, page, total_pages = [], 1, 1
+    while page <= total_pages and page <= 3:
+        params = {"team": team_id, "season": season, "league": league_id, "page": page}
+        r_stats = requests.get(
+            f"https://{API_FOOTBALL_HOST}/players",
+            headers=headers, params=params, timeout=8,
+        )
+        r_stats.raise_for_status()
+        payload = r_stats.json()
+        errors = payload.get("errors")
+        if errors and "season" in str(errors).lower():
+            return [], True
+        total_pages = payload.get("paging", {}).get("total", 1)
+        items.extend(payload.get("response", []))
+        page += 1
+    return items, False
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_squad(team_name: str, league_name: str = "Premier League", seed_offset: int = 0, n_games: int = 5) -> pd.DataFrame:
+    """Fetches squad player stats STRICTLY for current league matches."""
+    if API_FOOTBALL_KEY:
+        try:
+            headers = {"x-apisports-key": API_FOOTBALL_KEY}
+            clean_search_name = api_search_name(team_name)
+            r_team = requests.get(
+                f"https://{API_FOOTBALL_HOST}/teams",
+                headers=headers, params={"search": clean_search_name}, timeout=6,
+            )
+            r_team.raise_for_status()
+            team_res = r_team.json().get("response", [])
+
+            if team_res:
+                team_id = team_res[0]["team"]["id"]
+                season = _current_season_year()
+                league_id = API_FOOTBALL_LEAGUE_IDS.get(league_name, 39)
+                
+                pos_map = {"Goalkeeper": "GK", "Defender": "DF", "Midfielder": "MF", "Attacker": "FW"}
+                fallback_xg90 = {"FW": 0.30, "MF": 0.10, "DF": 0.02, "GK": 0.0}
+                fallback_xa90 = {"FW": 0.15, "MF": 0.16, "DF": 0.03, "GK": 0.0}
+
+                recent_ratings = fetch_player_recent_ratings(team_id, league_name=league_name, n_games=n_games)
+
+                items, blocked = _fetch_players_stats_all_pages(team_id, season, league_id, headers)
+                data_source = f"API-Football stats ({season} {league_name})"
+
+                if not items and not blocked:
+                    items, blocked = _fetch_players_stats_all_pages(team_id, season - 1, league_id, headers)
+                    data_source = f"API-Football stats ({season - 1} {league_name})"
+
+                if not items and season > API_FOOTBALL_FREE_TIER_MAX_SEASON:
+                    items, _ = _fetch_players_stats_all_pages(team_id, API_FOOTBALL_FREE_TIER_MAX_SEASON, league_id, headers)
+                    data_source = f"API-Football stats ({API_FOOTBALL_FREE_TIER_MAX_SEASON} {league_name} — stale, free-tier season cap)"
+
+                rows = _parse_players_stats_page(items, pos_map, recent_ratings, fallback_xg90, fallback_xa90)
+
+                if not rows:
+                    r_squad = requests.get(
+                        f"https://{API_FOOTBALL_HOST}/players/squads",
+                        headers=headers, params={"team": team_id}, timeout=8,
+                    )
+                    r_squad.raise_for_status()
+                    squad_res = r_squad.json().get("response", [])
+                    if squad_res and "players" in squad_res[0]:
+                        data_source = f"API-Football roster ({league_name})"
+                        for p in squad_res[0]["players"]:
+                            pos = pos_map.get(p.get("position"), "MF")
+                            name = p.get("name")
+                            recent = recent_ratings.get(name)
+                            rating, games_rated = (recent["avg_rating"], recent["games_rated"]) if recent else (6.8, 0)
+                            rows.append({
+                                "player": name, "position": pos, "minutes": 0,
+                                "xG90": fallback_xg90.get(pos, 0.08), "xA90": fallback_xa90.get(pos, 0.05),
+                                "key_passes90": 0.5 if pos == "MF" else 0.3,
+                                "avg_rating": rating, "games_rated": games_rated, "status": "Active",
+                            })
+
+                if rows:
+                    df = pd.DataFrame(rows)
+                    df["data_source"] = data_source
+                    return df
+        except Exception:
+            pass
+
+    df = _mock_squad(team_name, seed_offset, n_games)
+    df["data_source"] = f"Mock ({league_name} - API-Football unavailable)"
+    return df
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_team_form(team_name: str, league_name: str = "Premier League") -> pd.DataFrame:
+    league_code = LEAGUES.get(league_name)
+    if FOOTBALL_DATA_KEY:
+        try:
+            headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
+            r_std = requests.get(
+                f"{FOOTBALL_DATA_BASE}/competitions/{league_code}/standings",
+                headers=headers, timeout=8,
+            )
+            r_std.raise_for_status()
+            total_table = next(
+                (s["table"] for s in r_std.json().get("standings", []) if s.get("type") == "TOTAL"), []
+            )
+            team_id = None
+            team_name_match = _find_unique_team_match([row["team"]["name"] for row in total_table], team_name)
+            if team_name_match:
+                team_id = next((row["team"]["id"] for row in total_table if row["team"]["name"] == team_name_match), None)
+
+            if team_id:
+                r_m = requests.get(
+                    f"{FOOTBALL_DATA_BASE}/teams/{team_id}/matches",
+                    headers=headers, params={"status": "FINISHED", "limit": 5}, timeout=8,
+                )
+                r_m.raise_for_status()
+                matches = r_m.json().get("matches", [])[-5:]
+                rows = []
+                for idx, m in enumerate(matches):
+                    is_home = is_team_match(m["homeTeam"]["name"], team_name)
+                    gf = m["score"]["fullTime"]["home"] if is_home else m["score"]["fullTime"]["away"]
+                    ga = m["score"]["fullTime"]["away"] if is_home else m["score"]["fullTime"]["home"]
+                    if gf is None or ga is None:
+                        continue
+                    rows.append({
+                        "matches_ago": len(matches) - idx,
+                        "goals_for": gf, "goals_against": ga,
+                        "xG_for": gf, "xG_against": ga,
+                    })
+                if len(rows) >= 3:
+                    return pd.DataFrame(rows)
+        except Exception:
+            pass
+    return _mock_form(team_name)
+
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _fetch_api_football_fixture_id(home_team: str, away_team: str, league_name: str) -> Tuple[Optional[int], str]:
+    if not API_FOOTBALL_KEY:
+        return None, "no API_FOOTBALL_KEY configured"
+    try:
+        headers = {"x-apisports-key": API_FOOTBALL_KEY}
+        league_id = API_FOOTBALL_LEAGUE_IDS.get(league_name, 39)
+        r = requests.get(
+            f"https://{API_FOOTBALL_HOST}/fixtures",
+            headers=headers, params={"league": league_id, "next": 30},
+            timeout=8,
+        )
+        r.raise_for_status()
+        payload = r.json()
+        if payload.get("errors"):
+            return None, f"API-Football /fixtures error: {payload['errors']}"
+        for f in payload.get("response", []):
+            h, a = f["teams"]["home"]["name"], f["teams"]["away"]["name"]
+            if is_team_match(h, home_team) and is_team_match(a, away_team):
+                return f["fixture"]["id"], "ok"
+        return None, "match not found in the next 30 league-wide fixtures (may be further out than that window covers)"
+    except requests.exceptions.HTTPError as e:
+        code = e.response.status_code if e.response is not None else "?"
+        return None, f"HTTP {code} from /fixtures" + (" (likely daily quota exhausted)" if code in (429, 401, 403) else "")
+    except Exception as e:
+        return None, f"/fixtures request failed: {type(e).__name__}"
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_api_football_odds(home_team: str, away_team: str, league_name: str = "Premier League") -> Tuple[Optional[dict], str]:
+    if not API_FOOTBALL_KEY:
+        return None, "no API_FOOTBALL_KEY configured"
+    fixture_id, reason = _fetch_api_football_fixture_id(home_team, away_team, league_name)
+    if not fixture_id:
+        return None, f"fixture lookup failed ({reason})"
+    try:
+        headers = {"x-apisports-key": API_FOOTBALL_KEY}
+        r = requests.get(
+            f"https://{API_FOOTBALL_HOST}/odds",
+            headers=headers, params={"fixture": fixture_id}, timeout=8,
+        )
+        r.raise_for_status()
+        payload = r.json()
+        if payload.get("errors"):
+            return None, f"API-Football /odds error: {payload['errors']}"
+        response = payload.get("response", [])
+        if not response:
+            return None, "no odds published yet for this fixture (normal if >14 days out or very stale)"
+
+        home_p, draw_p, away_p = [], [], []
+        over_p, under_p, btts_yes_p, btts_no_p = [], [], [], []
+
+        bookmakers = response[0].get("bookmakers", [])
+        for bk in bookmakers:
+            for bet in bk.get("bets", []):
+                name = bet.get("name", "")
+                values = bet.get("values", [])
+                if name == "Match Winner":
+                    for v in values:
+                        if v["value"] == "Home": home_p.append(float(v["odd"]))
+                        elif v["value"] == "Draw": draw_p.append(float(v["odd"]))
+                        elif v["value"] == "Away": away_p.append(float(v["odd"]))
+                elif name in ("Over/Under 2.5 Goals", "Goals Over/Under"):
+                    for v in values:
+                        label = v["value"]
+                        if "Over" in label: over_p.append(float(v["odd"]))
+                        elif "Under" in label: under_p.append(float(v["odd"]))
+                elif name in ("Both Teams Score", "Both Teams To Score"):
+                    for v in values:
+                        if v["value"] == "Yes": btts_yes_p.append(float(v["odd"]))
+                        elif v["value"] == "No": btts_no_p.append(float(v["odd"]))
+
+        if not home_p:
+            return None, f"{len(bookmakers)} bookmaker(s) found but none listed a 'Match Winner' market"
+
+        return {
+            "1X2": {
+                "home": round(float(np.mean(home_p)), 2),
+                "draw": round(float(np.mean(draw_p)), 2) if draw_p else None,
+                "away": round(float(np.mean(away_p)), 2) if away_p else None,
+            },
+            "over_2_5": round(float(np.mean(over_p)), 2) if over_p else None,
+            "under_2_5": round(float(np.mean(under_p)), 2) if under_p else None,
+            "btts_yes": round(float(np.mean(btts_yes_p)), 2) if btts_yes_p else None,
+            "btts_no": round(float(np.mean(btts_no_p)), 2) if btts_no_p else None,
+            "source": f"API-Football odds ({len(bookmakers)} bookmakers)",
+        }, "ok"
+    except requests.exceptions.HTTPError as e:
+        code = e.response.status_code if e.response is not None else "?"
+        return None, f"HTTP {code} from /odds" + (" (likely daily quota exhausted)" if code in (429, 401, 403) else "")
+    except Exception as e:
+        return None, f"/odds request failed: {type(e).__name__}"
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_market_odds(home_team: str, away_team: str, league_name: str = "Premier League") -> dict:
+    sport_key = ODDS_API_SPORT_KEYS.get(league_name, "soccer_epl")
+    reasons = []
+
+    if THE_ODDS_API_KEY:
+        for market_param in ["h2h,totals", "h2h"]:
+            try:
+                params = {
+                    "apiKey": THE_ODDS_API_KEY, 
+                    "regions": "uk,eu", 
+                    "markets": market_param, 
+                    "oddsFormat": "decimal"
+                }
+                r = requests.get(f"{ODDS_API_BASE}/sports/{sport_key}/odds", params=params, timeout=8)
+                r.raise_for_status()
+                events = r.json()
+                matched_event = False
+                for ev in events:
+                    if is_team_match(ev["home_team"], home_team) and is_team_match(ev["away_team"], away_team):
+                        matched_event = True
+                        h2h_prices, ou_prices = {"h": [], "d": [], "a": []}, {"o": [], "u": []}
+                        
+                        for book in ev.get("bookmakers", []):
+                            for m in book.get("markets", []):
+                                if m["key"] == "h2h":
+                                    for o in m.get("outcomes", []):
+                                        if is_team_match(o["name"], ev["home_team"]): h2h_prices["h"].append(o["price"])
+                                        elif o["name"] == "Draw": h2h_prices["d"].append(o["price"])
+                                        else: h2h_prices["a"].append(o["price"])
+                                elif m["key"] == "totals":
+                                    for o in m.get("outcomes", []):
+                                        if o.get("point") != 2.5:
+                                            continue
+                                        if o["name"] == "Over": ou_prices["o"].append(o["price"])
+                                        elif o["name"] == "Under": ou_prices["u"].append(o["price"])
+
+                        if h2h_prices["h"]:
+                            return {
+                                "1X2": {
+                                    "home": round(np.mean(h2h_prices["h"]), 2),
+                                    "draw": round(np.mean(h2h_prices["d"]), 2) if h2h_prices["d"] else None,
+                                    "away": round(np.mean(h2h_prices["a"]), 2) if h2h_prices["a"] else None
+                                },
+                                "over_2_5": round(np.mean(ou_prices["o"]), 2) if ou_prices["o"] else None,
+                                "under_2_5": round(np.mean(ou_prices["u"]), 2) if ou_prices["u"] else None,
+                                "btts_yes": None,
+                                "btts_no": None,
+                                "source": f"Consensus Average ({len(ev['bookmakers'])} Bookies)"
+                            }
+                if not matched_event:
+                    reasons.append("The Odds API: fixture not found in active listings")
+                    break
+            except requests.exceptions.HTTPError as e:
+                code = e.response.status_code if e.response is not None else "?"
+                if code == 422 and market_param != "h2h":
+                    continue  # Auto-retry with simpler moneyline markets
+                reasons.append(f"The Odds API: HTTP {code}" + (" (quota/auth/invalid param)" if code in (401, 429, 422) else ""))
+                break
+            except Exception as e:
+                reasons.append(f"The Odds API: {type(e).__name__}")
+                break
+    else:
+        reasons.append("The Odds API: no key configured")
+
+    api_football_result, af_reason = fetch_api_football_odds(home_team, away_team, league_name)
+    if api_football_result:
+        return api_football_result
+    reasons.append(f"API-Football: {af_reason}")
+
+    mock = _mock_odds(home_team, away_team)
+    mock["source"] = "Mock Data Engine — " + " | ".join(reasons)
+    return mock
+
+# ====================================================================================
+# 5. QUANTITATIVE MODELING ENGINE
+# ====================================================================================
+def _find_unique_team_match(candidates, target_name: str):
+    target_norm = normalize_team_name(target_name).casefold()
+    exact = [c for c in candidates if normalize_team_name(c).casefold() == target_norm]
+    if exact:
+        return exact[0]
+    hits = [c for c in candidates if is_team_match(c, target_name)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def calculate_team_base_lambdas(
+    home_team: str, away_team: str, team_stats: pd.DataFrame
+) -> Tuple[float, float, dict, dict, float, float]:
+    league_home_avg = max(team_stats['home_xG_for'].mean(), 1.0)
+    league_away_avg = max(team_stats['away_xG_for'].mean(), 1.0)
+    
+    home_match = _find_unique_team_match(team_stats['team'].astype(str).tolist(), home_team)
+    away_match = _find_unique_team_match(team_stats['team'].astype(str).tolist(), away_team)
+    h_stat = team_stats.loc[team_stats['team'] == home_match] if home_match else team_stats.iloc[0:0]
+    a_stat = team_stats.loc[team_stats['team'] == away_match] if away_match else team_stats.iloc[0:0]
+    
+    home_att = (h_stat['home_xG_for'].values[0] if not h_stat.empty else 1.55) / league_home_avg
+    away_def = (a_stat['away_xG_against'].values[0] if not a_stat.empty else 1.20) / league_home_avg
+    
+    away_att = (a_stat['away_xG_for'].values[0] if not a_stat.empty else 1.20) / league_away_avg
+    home_def = (h_stat['home_xG_against'].values[0] if not h_stat.empty else 1.55) / league_away_avg
+    
+    base_lam_home = league_home_avg * home_att * away_def
+    base_lam_away = league_away_avg * away_att * home_def
+
+    home_info = {
+        "goals_for": float(h_stat['home_xG_for'].values[0]) if not h_stat.empty else None,
+        "goals_against": float(h_stat['home_xG_against'].values[0]) if not h_stat.empty else None,
+        "attack": round(float(home_att), 3), "defense": round(float(home_def), 3),
+        "tier": "live standings" if not h_stat.empty else "no match — league average", "n": None,
+        "raw_attack": None, "raw_defense": None, "raw_goals_for": None, "raw_goals_against": None,
+    }
+    away_info = {
+        "goals_for": float(a_stat['away_xG_for'].values[0]) if not a_stat.empty else None,
+        "goals_against": float(a_stat['away_xG_against'].values[0]) if not a_stat.empty else None,
+        "attack": round(float(away_att), 3), "defense": round(float(away_def), 3),
+        "tier": "live standings" if not a_stat.empty else "no match — league average", "n": None,
+        "raw_attack": None, "raw_defense": None, "raw_goals_for": None, "raw_goals_against": None,
+    }
+    
+    return (round(base_lam_home, 3), round(base_lam_away, 3), home_info, away_info,
+            round(float(league_home_avg), 3), round(float(league_away_avg), 3))
+
+def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matches: int = 5) -> dict:
+    default_res = {"gf": 1.5, "xgf": 1.5, "ga": 1.2, "xga": 1.2, "opp_def": 1.00, "opp_att": 1.00, "season_gf": 1.5, "season_ga": 1.5}
+    if hist_df.empty: return default_res
+
+    league_h_g = max(hist_df['FTHG'].mean(), 1.0)
+    league_a_g = max(hist_df['FTAG'].mean(), 1.0)
+
+    home_all = _match_hist_team_rows(hist_df, 'HomeTeam', team_name).head(38)
+    away_all = _match_hist_team_rows(hist_df, 'AwayTeam', team_name).head(38)
+    
+    gf_all, ga_all = [], []
+    if not home_all.empty:
+        gf_all.extend(home_all['FTHG'].tolist())
+        ga_all.extend(home_all['FTAG'].tolist())
+    if not away_all.empty:
+        gf_all.extend(away_all['FTAG'].tolist())
+        ga_all.extend(away_all['FTHG'].tolist())
+        
+    season_gf = round(float(np.mean(gf_all)), 2) if gf_all else league_h_g
+    season_ga = round(float(np.mean(ga_all)), 2) if ga_all else league_a_g
+
     home_m = _match_hist_team_rows(hist_df, 'HomeTeam', team_name)
     away_m = _match_hist_team_rows(hist_df, 'AwayTeam', team_name)
     combined_matches = pd.concat([home_m, away_m]).sort_values('Date', ascending=False).head(n_matches)
@@ -455,413 +1174,6 @@ def _mock_odds(home: str, away: str) -> dict:
         "btts_no": round(1 / (0.47 * margin), 2),
         "source": "Mock Data Engine"
     }
-
-# ====================================================================================
-# 4. LIVE DATA LAYER
-# ====================================================================================
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_weather(lat: float, lon: float, kickoff: dt.datetime) -> dict:
-    try:
-        params = {
-            "latitude": lat, "longitude": lon,
-            "hourly": "temperature_2m,precipitation,wind_speed_10m",
-            "forecast_days": 7, "timezone": "auto",
-        }
-        r = requests.get(OPEN_METEO_BASE, params=params, timeout=6)
-        r.raise_for_status()
-        data = r.json()
-        hourly_times = data["hourly"]["time"]
-        target = kickoff.strftime("%Y-%m-%dT%H:00")
-        idx = hourly_times.index(target) if target in hourly_times else 0
-        return {
-            "temperature_c": data["hourly"]["temperature_2m"][idx],
-            "precipitation_mm": data["hourly"]["precipitation"][idx],
-            "wind_speed_kmh": data["hourly"]["wind_speed_10m"][idx],
-            "source": "Open-Meteo API",
-        }
-    except Exception:
-        return {"temperature_c": 14.5, "precipitation_mm": 0.0, "wind_speed_kmh": 12.0, "source": "Mock Weather"}
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_fixtures(league_name: str) -> pd.DataFrame:
-    league_code = LEAGUES.get(league_name)
-    if FOOTBALL_DATA_KEY:
-        try:
-            headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
-            r = requests.get(f"{FOOTBALL_DATA_BASE}/competitions/{league_code}/matches", headers=headers, params={"status": "SCHEDULED"}, timeout=6)
-            r.raise_for_status()
-            matches = r.json().get("matches", [])[:8]
-            rows = [{
-                "fixture_id": m["id"], "home_team": m["homeTeam"]["name"], "away_team": m["awayTeam"]["name"],
-                "kickoff": dt.datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00")),
-            } for m in matches]
-            if rows:
-                return pd.DataFrame(rows)
-        except Exception:
-            pass
-    return _mock_fixtures(league_name)
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_team_season_stats(league_name: str) -> pd.DataFrame:
-    league_code = LEAGUES.get(league_name)
-    if FOOTBALL_DATA_KEY:
-        try:
-            headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
-            r = requests.get(
-                f"{FOOTBALL_DATA_BASE}/competitions/{league_code}/standings",
-                headers=headers, timeout=8,
-            )
-            r.raise_for_status()
-            standings = r.json().get("standings", [])
-            home_table = next((s["table"] for s in standings if s.get("type") == "HOME"), None)
-            away_table = next((s["table"] for s in standings if s.get("type") == "AWAY"), None)
-
-            if home_table and away_table:
-                home_lookup = {row["team"]["name"]: row for row in home_table}
-                away_lookup = {row["team"]["name"]: row for row in away_table}
-                rows = []
-                for name in set(home_lookup) & set(away_lookup):
-                    h, a = home_lookup[name], away_lookup[name]
-                    if not h.get("playedGames") or not a.get("playedGames"):
-                        continue
-                    rows.append({
-                        "team": name,
-                        "home_xG_for": round(h["goalsFor"] / h["playedGames"], 2),
-                        "home_xG_against": round(h["goalsAgainst"] / h["playedGames"], 2),
-                        "away_xG_for": round(a["goalsFor"] / a["playedGames"], 2),
-                        "away_xG_against": round(a["goalsAgainst"] / a["playedGames"], 2),
-                    })
-                if rows:
-                    return pd.DataFrame(rows)
-        except Exception:
-            pass
-    return _mock_season_stats(league_name)
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_player_recent_ratings(team_id: int, league_name: str = "Premier League", n_games: int = 5) -> dict:
-    if not API_FOOTBALL_KEY:
-        return {}
-    headers = {"x-apisports-key": API_FOOTBALL_KEY}
-    league_id = API_FOOTBALL_LEAGUE_IDS.get(league_name, 39)
-    try:
-        r_fx = requests.get(
-            f"https://{API_FOOTBALL_HOST}/fixtures",
-            headers=headers, 
-            params={"team": team_id, "league": league_id, "last": n_games}, 
-            timeout=8,
-        )
-        r_fx.raise_for_status()
-        fixture_ids = [f["fixture"]["id"] for f in r_fx.json().get("response", [])]
-
-        ratings: dict = {}
-        for fid in fixture_ids:
-            r_pl = requests.get(
-                f"https://{API_FOOTBALL_HOST}/fixtures/players",
-                headers=headers, params={"fixture": fid}, timeout=8,
-            )
-            r_pl.raise_for_status()
-            for team_block in r_pl.json().get("response", []):
-                if team_block.get("team", {}).get("id") != team_id:
-                    continue
-                for p in team_block.get("players", []):
-                    name = p.get("player", {}).get("name")
-                    stat = (p.get("statistics") or [{}])[0]
-                    games = stat.get("games", {}) or {}
-                    rating_raw = games.get("rating")
-                    minutes = games.get("minutes")
-                    if name and rating_raw and minutes:
-                        ratings.setdefault(name, []).append(float(rating_raw))
-
-        return {
-            name: {"avg_rating": round(sum(vals) / len(vals), 2), "games_rated": len(vals)}
-            for name, vals in ratings.items()
-        }
-    except Exception:
-        return {}
-
-def _parse_players_stats_page(response_items: list, pos_map: dict, recent_ratings: dict, fallback_xg90: dict, fallback_xa90: dict) -> list:
-    rows = []
-    for p in response_items:
-        info = p.get("player", {})
-        stat = (p.get("statistics") or [{}])[0]
-        games = stat.get("games", {}) or {}
-        goals = stat.get("goals", {}) or {}
-        minutes = games.get("minutes") or 0
-        pos = pos_map.get(games.get("position"), "MF")
-        goals_total = goals.get("total") or 0
-        assists_total = goals.get("assists") or 0
-        name = info.get("name")
-
-        season_rating_raw = games.get("rating")
-        recent = recent_ratings.get(name)
-        
-        if recent and recent["games_rated"] > 0:
-            rating = recent["avg_rating"]
-            games_rated = recent["games_rated"]
-        elif season_rating_raw:
-            rating = round(float(season_rating_raw), 2)
-            games_rated = 0
-        else:
-            rating = 6.8
-            games_rated = 0
-
-        if minutes and minutes > 0:
-            xg90 = round(goals_total / minutes * 90, 3)
-            xa90 = round(assists_total / minutes * 90, 3)
-        else:
-            xg90 = fallback_xg90.get(pos, 0.08)
-            xa90 = fallback_xa90.get(pos, 0.05)
-
-        rows.append({
-            "player": name, "position": pos, "minutes": minutes,
-            "xG90": xg90, "xA90": xa90,
-            "key_passes90": round(assists_total / max(minutes, 1) * 90 * 1.8, 2),
-            "avg_rating": rating, "games_rated": games_rated, "status": "Active",
-        })
-    return rows
-
-def _fetch_players_stats_all_pages(team_id: int, season: int, league_id: int, headers: dict) -> list:
-    items, page, total_pages = [], 1, 1
-    while page <= total_pages and page <= 3:
-        params = {"team": team_id, "season": season, "league": league_id, "page": page}
-        r_stats = requests.get(
-            f"https://{API_FOOTBALL_HOST}/players",
-            headers=headers, params=params, timeout=8,
-        )
-        r_stats.raise_for_status()
-        payload = r_stats.json()
-        total_pages = payload.get("paging", {}).get("total", 1)
-        items.extend(payload.get("response", []))
-        page += 1
-    return items
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_squad(team_name: str, league_name: str = "Premier League", seed_offset: int = 0, n_games: int = 5) -> pd.DataFrame:
-    if API_FOOTBALL_KEY:
-        try:
-            headers = {"x-apisports-key": API_FOOTBALL_KEY}
-            clean_search_name = api_search_name(team_name)
-            r_team = requests.get(
-                f"https://{API_FOOTBALL_HOST}/teams",
-                headers=headers, params={"search": clean_search_name}, timeout=6,
-            )
-            r_team.raise_for_status()
-            team_res = r_team.json().get("response", [])
-
-            if team_res:
-                team_id = team_res[0]["team"]["id"]
-                season = _current_season_year()
-                league_id = API_FOOTBALL_LEAGUE_IDS.get(league_name, 39)
-                
-                pos_map = {"Goalkeeper": "GK", "Defender": "DF", "Midfielder": "MF", "Attacker": "FW"}
-                fallback_xg90 = {"FW": 0.30, "MF": 0.10, "DF": 0.02, "GK": 0.0}
-                fallback_xa90 = {"FW": 0.15, "MF": 0.16, "DF": 0.03, "GK": 0.0}
-
-                recent_ratings = fetch_player_recent_ratings(team_id, league_name=league_name, n_games=n_games)
-                items = _fetch_players_stats_all_pages(team_id, season, league_id, headers)
-                data_source = f"API-Football stats ({season} {league_name})"
-
-                if not items:
-                    items = _fetch_players_stats_all_pages(team_id, season - 1, league_id, headers)
-                    data_source = f"API-Football stats ({season - 1} {league_name})"
-
-                rows = _parse_players_stats_page(items, pos_map, recent_ratings, fallback_xg90, fallback_xa90)
-
-                if not rows:
-                    r_squad = requests.get(
-                        f"https://{API_FOOTBALL_HOST}/players/squads",
-                        headers=headers, params={"team": team_id}, timeout=8,
-                    )
-                    r_squad.raise_for_status()
-                    squad_res = r_squad.json().get("response", [])
-                    if squad_res and "players" in squad_res[0]:
-                        data_source = f"API-Football roster ({league_name})"
-                        for p in squad_res[0]["players"]:
-                            pos = pos_map.get(p.get("position"), "MF")
-                            name = p.get("name")
-                            recent = recent_ratings.get(name)
-                            rating, games_rated = (recent["avg_rating"], recent["games_rated"]) if recent else (6.8, 0)
-                            rows.append({
-                                "player": name, "position": pos, "minutes": 0,
-                                "xG90": fallback_xg90.get(pos, 0.08), "xA90": fallback_xa90.get(pos, 0.05),
-                                "key_passes90": 0.5 if pos == "MF" else 0.3,
-                                "avg_rating": rating, "games_rated": games_rated, "status": "Active",
-                            })
-
-                if rows:
-                    df = pd.DataFrame(rows)
-                    df["data_source"] = data_source
-                    return df
-        except Exception:
-            pass
-
-    df = _mock_squad(team_name, seed_offset, n_games)
-    df["data_source"] = f"Mock ({league_name} - API-Football unavailable)"
-    return df
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_team_form(team_name: str, league_name: str = "Premier League") -> pd.DataFrame:
-    league_code = LEAGUES.get(league_name)
-    if FOOTBALL_DATA_KEY:
-        try:
-            headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
-            r_std = requests.get(
-                f"{FOOTBALL_DATA_BASE}/competitions/{league_code}/standings",
-                headers=headers, timeout=8,
-            )
-            r_std.raise_for_status()
-            total_table = next(
-                (s["table"] for s in r_std.json().get("standings", []) if s.get("type") == "TOTAL"), []
-            )
-            team_id = None
-            team_name_match = _find_unique_team_match([row["team"]["name"] for row in total_table], team_name)
-            if team_name_match:
-                team_id = next((row["team"]["id"] for row in total_table if row["team"]["name"] == team_name_match), None)
-
-            if team_id:
-                r_m = requests.get(
-                    f"{FOOTBALL_DATA_BASE}/teams/{team_id}/matches",
-                    headers=headers, params={"status": "FINISHED", "limit": 5}, timeout=8,
-                )
-                r_m.raise_for_status()
-                matches = r_m.json().get("matches", [])[-5:]
-                rows = []
-                for idx, m in enumerate(matches):
-                    is_home = is_team_match(m["homeTeam"]["name"], team_name)
-                    gf = m["score"]["fullTime"]["home"] if is_home else m["score"]["fullTime"]["away"]
-                    ga = m["score"]["fullTime"]["away"] if is_home else m["score"]["fullTime"]["home"]
-                    if gf is None or ga is None:
-                        continue
-                    rows.append({
-                        "matches_ago": len(matches) - idx,
-                        "goals_for": gf, "goals_against": ga,
-                        "xG_for": gf, "xG_against": ga,
-                    })
-                if len(rows) >= 3:
-                    return pd.DataFrame(rows)
-        except Exception:
-            pass
-    return _mock_form(team_name)
-
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_market_odds(home_team: str, away_team: str, league_name: str = "Premier League") -> dict:
-    sport_key = ODDS_API_SPORT_KEYS.get(league_name, "soccer_epl")
-    reasons = []
-
-    if THE_ODDS_API_KEY:
-        # BUGFIX for HTTP 422: The Odds API v4 returns 422 if unsupported markets (e.g., btts) are passed.
-        # We query universally supported markets ("h2h,totals") and fall back to "h2h" on HTTP 422 errors.
-        for market_param in ["h2h,totals", "h2h"]:
-            try:
-                params = {
-                    "apiKey": THE_ODDS_API_KEY, 
-                    "regions": "uk,eu", 
-                    "markets": market_param, 
-                    "oddsFormat": "decimal"
-                }
-                r = requests.get(f"{ODDS_API_BASE}/sports/{sport_key}/odds", params=params, timeout=8)
-                r.raise_for_status()
-                events = r.json()
-                matched_event = False
-                for ev in events:
-                    if is_team_match(ev["home_team"], home_team) and is_team_match(ev["away_team"], away_team):
-                        matched_event = True
-                        h2h_prices, ou_prices = {"h": [], "d": [], "a": []}, {"o": [], "u": []}
-                        
-                        for book in ev.get("bookmakers", []):
-                            for m in book.get("markets", []):
-                                if m["key"] == "h2h":
-                                    for o in m.get("outcomes", []):
-                                        if is_team_match(o["name"], ev["home_team"]): h2h_prices["h"].append(o["price"])
-                                        elif o["name"] == "Draw": h2h_prices["d"].append(o["price"])
-                                        else: h2h_prices["a"].append(o["price"])
-                                elif m["key"] == "totals":
-                                    for o in m.get("outcomes", []):
-                                        if o.get("point") != 2.5:
-                                            continue
-                                        if o["name"] == "Over": ou_prices["o"].append(o["price"])
-                                        elif o["name"] == "Under": ou_prices["u"].append(o["price"])
-
-                        if h2h_prices["h"]:
-                            return {
-                                "1X2": {
-                                    "home": round(np.mean(h2h_prices["h"]), 2),
-                                    "draw": round(np.mean(h2h_prices["d"]), 2) if h2h_prices["d"] else None,
-                                    "away": round(np.mean(h2h_prices["a"]), 2) if h2h_prices["a"] else None
-                                },
-                                "over_2_5": round(np.mean(ou_prices["o"]), 2) if ou_prices["o"] else None,
-                                "under_2_5": round(np.mean(ou_prices["u"]), 2) if ou_prices["u"] else None,
-                                "btts_yes": None,
-                                "btts_no": None,
-                                "source": f"Consensus Average ({len(ev['bookmakers'])} Bookies)"
-                            }
-                if not matched_event:
-                    reasons.append("The Odds API: fixture not found in active listings")
-                    break
-            except requests.exceptions.HTTPError as e:
-                code = e.response.status_code if e.response is not None else "?"
-                if code == 422 and market_param != "h2h":
-                    continue  # Auto-retry with simpler moneyline markets
-                reasons.append(f"The Odds API: HTTP {code}" + (" (quota/auth/invalid param)" if code in (401, 429, 422) else ""))
-                break
-            except Exception as e:
-                reasons.append(f"The Odds API: {type(e).__name__}")
-                break
-    else:
-        reasons.append("The Odds API: no key configured")
-
-    mock = _mock_odds(home_team, away_team)
-    mock["source"] = "Mock Data Engine — " + " | ".join(reasons)
-    return mock
-
-# ====================================================================================
-# 5. QUANTITATIVE MODELING ENGINE
-# ====================================================================================
-def _find_unique_team_match(candidates, target_name: str):
-    target_norm = normalize_team_name(target_name).casefold()
-    exact = [c for c in candidates if normalize_team_name(c).casefold() == target_norm]
-    if exact:
-        return exact[0]
-    hits = [c for c in candidates if is_team_match(c, target_name)]
-    return hits[0] if len(hits) == 1 else None
-
-def calculate_team_base_lambdas(
-    home_team: str, away_team: str, team_stats: pd.DataFrame
-) -> Tuple[float, float, dict, dict, float, float]:
-    league_home_avg = max(team_stats['home_xG_for'].mean(), 1.0)
-    league_away_avg = max(team_stats['away_xG_for'].mean(), 1.0)
-    
-    home_match = _find_unique_team_match(team_stats['team'].astype(str).tolist(), home_team)
-    away_match = _find_unique_team_match(team_stats['team'].astype(str).tolist(), away_team)
-    h_stat = team_stats.loc[team_stats['team'] == home_match] if home_match else team_stats.iloc[0:0]
-    a_stat = team_stats.loc[team_stats['team'] == away_match] if away_match else team_stats.iloc[0:0]
-    
-    home_att = (h_stat['home_xG_for'].values[0] if not h_stat.empty else 1.55) / league_home_avg
-    away_def = (a_stat['away_xG_against'].values[0] if not a_stat.empty else 1.20) / league_home_avg
-    
-    away_att = (a_stat['away_xG_for'].values[0] if not a_stat.empty else 1.20) / league_away_avg
-    home_def = (h_stat['home_xG_against'].values[0] if not h_stat.empty else 1.55) / league_away_avg
-    
-    base_lam_home = league_home_avg * home_att * away_def
-    base_lam_away = league_away_avg * away_att * home_def
-
-    home_info = {
-        "goals_for": float(h_stat['home_xG_for'].values[0]) if not h_stat.empty else None,
-        "goals_against": float(h_stat['home_xG_against'].values[0]) if not h_stat.empty else None,
-        "attack": round(float(home_att), 3), "defense": round(float(home_def), 3),
-        "tier": "live standings" if not h_stat.empty else "no match — league average", "n": None,
-        "raw_attack": None, "raw_defense": None, "raw_goals_for": None, "raw_goals_against": None,
-    }
-    away_info = {
-        "goals_for": float(a_stat['away_xG_for'].values[0]) if not a_stat.empty else None,
-        "goals_against": float(a_stat['away_xG_against'].values[0]) if not a_stat.empty else None,
-        "attack": round(float(away_att), 3), "defense": round(float(away_def), 3),
-        "tier": "live standings" if not a_stat.empty else "no match — league average", "n": None,
-        "raw_attack": None, "raw_defense": None, "raw_goals_for": None, "raw_goals_against": None,
-    }
-    
-    return (round(base_lam_home, 3), round(base_lam_away, 3), home_info, away_info,
-            round(float(league_home_avg), 3), round(float(league_away_avg), 3))
 
 def player_impact_score(squad: pd.DataFrame, active_mask: dict) -> Tuple[float, pd.DataFrame]:
     if squad.empty: return 1.0, squad
