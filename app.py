@@ -77,6 +77,15 @@ SECOND_TIER_DISPLAY_NAMES = {
     "F2": "Ligue 2",
 }
 
+# Baseline League Discipline Stats (Avg Fouls and Cards per match)
+LEAGUE_DISCIPLINE_STATS = {
+    "Premier League": {"avg_fouls": 21.5, "avg_cards": 4.1},
+    "La Liga": {"avg_fouls": 25.5, "avg_cards": 5.2},
+    "Serie A": {"avg_fouls": 24.0, "avg_cards": 4.6},
+    "Bundesliga": {"avg_fouls": 22.5, "avg_cards": 4.2},
+    "Ligue 1": {"avg_fouls": 23.5, "avg_cards": 4.0},
+}
+
 PROMOTION_ATTACK_DISCOUNT = 0.55
 PROMOTION_DEFENSE_PENALTY = 1.48
 
@@ -143,42 +152,18 @@ def fetch_historical_league_data(league_code: str = "E0") -> pd.DataFrame:
 
 
 HIST_TEAM_ALIASES = {
-    "Manchester City": "Man City",
-    "Manchester United": "Man United",
-    "Newcastle United": "Newcastle",
-    "Tottenham Hotspur": "Tottenham",
-    "Wolverhampton Wanderers": "Wolves",
-    "Nottingham Forest": "Nott'm Forest",
-    "West Ham United": "West Ham",
-    "West Bromwich Albion": "West Brom",
-    "Brighton & Hove Albion": "Brighton",
-    "Leicester City": "Leicester",
-    "Leeds United": "Leeds",
-    "AFC Bournemouth": "Bournemouth",
-    "Atletico Madrid": "Ath Madrid",
-    "Atlético Madrid": "Ath Madrid",
-    "Athletic Club": "Ath Bilbao",
-    "Athletic Bilbao": "Ath Bilbao",
-    "Real Betis": "Betis",
-    "Celta Vigo": "Celta",
-    "Deportivo Alaves": "Alaves",
-    "Rayo Vallecano": "Vallecano",
-    "AC Milan": "Milan",
-    "Internazionale": "Inter",
-    "Inter Milan": "Inter",
-    "Hellas Verona": "Verona",
-    "Borussia Dortmund": "Dortmund",
-    "Borussia Monchengladbach": "M'gladbach",
-    "Bayer Leverkusen": "Leverkusen",
-    "Eintracht Frankfurt": "Ein Frankfurt",
-    "1899 Hoffenheim": "Hoffenheim",
-    "1. FC Koln": "FC Koln",
-    "Paris Saint Germain": "Paris SG",
-    "Paris Saint-Germain": "Paris SG",
-    "Saint-Etienne": "St Etienne",
-    "AS Saint-Etienne": "St Etienne",
-    "Olympique Marseille": "Marseille",
-    "Olympique Lyonnais": "Lyon",
+    "Manchester City": "Man City", "Manchester United": "Man United", "Newcastle United": "Newcastle",
+    "Tottenham Hotspur": "Tottenham", "Wolverhampton Wanderers": "Wolves", "Nottingham Forest": "Nott'm Forest",
+    "West Ham United": "West Ham", "West Bromwich Albion": "West Brom", "Brighton & Hove Albion": "Brighton",
+    "Leicester City": "Leicester", "Leeds United": "Leeds", "AFC Bournemouth": "Bournemouth",
+    "Atletico Madrid": "Ath Madrid", "Atlético Madrid": "Ath Madrid", "Athletic Club": "Ath Bilbao",
+    "Athletic Bilbao": "Ath Bilbao", "Real Betis": "Betis", "Celta Vigo": "Celta",
+    "Deportivo Alaves": "Alaves", "Rayo Vallecano": "Vallecano", "AC Milan": "Milan",
+    "Internazionale": "Inter", "Inter Milan": "Inter", "Hellas Verona": "Verona",
+    "Borussia Dortmund": "Dortmund", "Borussia Monchengladbach": "M'gladbach", "Bayer Leverkusen": "Leverkusen",
+    "Eintracht Frankfurt": "Ein Frankfurt", "1899 Hoffenheim": "Hoffenheim", "1. FC Koln": "FC Koln",
+    "Paris Saint Germain": "Paris SG", "Paris Saint-Germain": "Paris SG", "Saint-Etienne": "St Etienne",
+    "AS Saint-Etienne": "St Etienne", "Olympique Marseille": "Marseille", "Olympique Lyonnais": "Lyon",
     "Coventry City": "Coventry",
 }
 
@@ -202,7 +187,6 @@ def _match_hist_team_rows(hist_df: pd.DataFrame, column: str, team_name: str) ->
         return exact
 
     candidates = hist_df[column].dropna().unique()
-
     forward_hits = [c for c in candidates if target.casefold() in c.casefold()]
     if len(forward_hits) == 1:
         return hist_df[hist_df[column] == forward_hits[0]]
@@ -323,7 +307,7 @@ def _mock_squad(team: str, seed_offset: int = 0, n_games: int = 5) -> pd.DataFra
         xg90 = round(max(0, np.random.normal(0.38 if pos == "FW" else 0.12 if pos == "MF" else 0.02, 0.10)), 3)
         xa90 = round(max(0, np.random.normal(0.22 if pos in ("FW", "MF") else 0.03, 0.08)), 3)
         games_rated = min(n_games, max(0, n_games - random.choice([0, 0, 0, 1, 2, n_games])))
-        rating = round(np.random.normal(7.0, 0.5), 2) if games_rated > 0 else None
+        rating = round(np.random.normal(7.0, 0.5), 2) if games_rated > 0 else 6.8
         key_passes90 = round(max(0, np.random.normal(1.5 if pos == "MF" else 0.6, 0.5)), 2)
         rows.append({
             "player": name, "position": pos, "minutes": minutes,
@@ -504,12 +488,21 @@ def _parse_players_stats_page(response_items: list, pos_map: dict, recent_rating
         assists_total = goals.get("assists") or 0
         name = info.get("name")
 
+        # Player Rating Logic:
+        # 1. Use recent form rating if they actually played in the recent window.
+        # 2. If they didn't play recently, fallback to their overall season average rating.
+        # 3. Only fallback to 6.8 if BOTH are entirely missing.
+        season_rating_raw = games.get("rating")
         recent = recent_ratings.get(name)
-        if recent:
-            rating, games_rated = recent["avg_rating"], recent["games_rated"]
+        
+        if recent and recent["games_rated"] > 0:
+            rating = recent["avg_rating"]
+            games_rated = recent["games_rated"]
+        elif season_rating_raw:
+            rating = round(float(season_rating_raw), 2)
+            games_rated = 0
         else:
-            season_rating_raw = games.get("rating")
-            rating = round(float(season_rating_raw), 2) if season_rating_raw else 6.8
+            rating = 6.8
             games_rated = 0
 
         if minutes and minutes > 0:
@@ -651,23 +644,49 @@ def fetch_team_form(team_name: str, league_name: str = "Premier League") -> pd.D
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_market_odds(home_team: str, away_team: str, league_name: str = "Premier League") -> dict:
+    """
+    Fetches odds from The Odds API and calculates the mathematical average 
+    (Consensus) across all available bookmakers.
+    """
     sport_key = ODDS_API_SPORT_KEYS.get(league_name, "soccer_epl")
-    if THE_ODDS_API_KEY:
-        try:
-            r = requests.get(f"{ODDS_API_BASE}/sports/{sport_key}/odds", params={"apiKey": THE_ODDS_API_KEY, "regions": "uk,eu", "markets": "h2h,totals", "oddsFormat": "decimal"}, timeout=6)
-            r.raise_for_status()
-            events = r.json()
-            for ev in events:
-                if home_team.lower() in ev["home_team"].lower():
-                    book = ev["bookmakers"][0]
-                    h2h = next(m for m in book["markets"] if m["key"] == "h2h")
-                    prices = {o["name"]: o["price"] for o in h2h["outcomes"]}
-                    return {
-                        "1X2": {"home": prices.get(ev["home_team"]), "draw": prices.get("Draw"), "away": prices.get(ev["away_team"])},
-                        "source": f"The Odds API ({book['title']}, {sport_key})"
-                    }
-        except Exception:
-            pass
+    if not THE_ODDS_API_KEY: 
+        return _mock_odds(home_team, away_team)
+        
+    try:
+        r = requests.get(f"{ODDS_API_BASE}/sports/{sport_key}/odds", params={"apiKey": THE_ODDS_API_KEY, "regions": "uk,eu", "markets": "h2h,totals", "oddsFormat": "decimal"}, timeout=8)
+        r.raise_for_status()
+        events = r.json()
+        for ev in events:
+            if home_team.lower() in ev["home_team"].lower() or ev["home_team"].lower() in home_team.lower():
+                h2h_prices, ou_prices = {"h": [], "d": [], "a": []}, {"o": [], "u": []}
+                
+                for book in ev["bookmakers"]:
+                    for m in book["markets"]:
+                        if m["key"] == "h2h":
+                            for o in m["outcomes"]:
+                                if o["name"] == ev["home_team"]: h2h_prices["h"].append(o["price"])
+                                elif o["name"] == "Draw": h2h_prices["d"].append(o["price"])
+                                else: h2h_prices["a"].append(o["price"])
+                        elif m["key"] == "totals":
+                            for o in m["outcomes"]:
+                                if o["name"] == "Over": ou_prices["o"].append(o["price"])
+                                elif o["name"] == "Under": ou_prices["u"].append(o["price"])
+
+                if not h2h_prices["h"]: return _mock_odds(home_team, away_team)
+                
+                return {
+                    "1X2": {
+                        "home": round(np.mean(h2h_prices["h"]), 2),
+                        "draw": round(np.mean(h2h_prices["d"]), 2),
+                        "away": round(np.mean(h2h_prices["a"]), 2)
+                    },
+                    "over_2_5": round(np.mean(ou_prices["o"]), 2) if ou_prices["o"] else None,
+                    "under_2_5": round(np.mean(ou_prices["u"]), 2) if ou_prices["u"] else None,
+                    "source": f"Consensus Average ({len(ev['bookmakers'])} Bookies)"
+                }
+    except Exception:
+        pass
+        
     return _mock_odds(home_team, away_team)
 
 # ====================================================================================
@@ -710,7 +729,8 @@ def calculate_team_base_lambdas(
             round(float(league_home_avg), 3), round(float(league_away_avg), 3))
 
 
-def player_impact_score(squad: pd.DataFrame, active_mask: dict) -> Tuple[float, pd.DataFrame]:
+def player_impact_score(squad: pd.DataFrame, active_mask: dict, is_facing_promoted: bool = False, is_promoted_team: bool = False) -> Tuple[float, pd.DataFrame]:
+    if squad.empty: return 1.0, squad
     squad = squad.copy()
     squad["status"] = squad["player"].map(lambda p: "Active" if active_mask.get(p, True) else "Injured/Out")
     squad["PIV"] = (squad["xG90"] + 0.85 * squad["xA90"]).round(3)
@@ -725,6 +745,13 @@ def player_impact_score(squad: pd.DataFrame, active_mask: dict) -> Tuple[float, 
 
     availability_ratio = active_piv / max(total_piv, 1e-6)
     piv_multiplier = 0.60 + 0.40 * availability_ratio
+    
+    # Apply Tier Adjustments for Lineup Impact
+    if is_facing_promoted:
+        piv_multiplier *= 1.05
+    elif is_promoted_team:
+        piv_multiplier *= 0.88
+        
     return round(piv_multiplier, 3), squad
 
 
@@ -773,14 +800,17 @@ class TeamModelInputs:
     form_rating: float
     weather_mult: float
     rest_mult: float
-    xg_reg_mult: float = 1.0
+    xg_att_reg_mult: float = 1.0
+    xg_def_reg_mult_opponent: float = 1.0
     press_mult: float = 1.0
     travel_mult: float = 1.0
     squad_table: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     @property
     def lambda_final(self) -> float:
-        val = self.base_lambda * self.piv_multiplier * self.form_mult * self.weather_mult * self.rest_mult * self.xg_reg_mult * self.press_mult * self.travel_mult
+        # Cross-pollination: xg_def_reg_mult_opponent is used because the OPPONENT'S 
+        # defensive vulnerability increases THIS team's final scoring expectation.
+        val = self.base_lambda * self.piv_multiplier * self.form_mult * self.weather_mult * self.rest_mult * self.xg_att_reg_mult * self.xg_def_reg_mult_opponent * self.press_mult * self.travel_mult
         return round(max(val, 0.05), 3)
 
 
@@ -868,7 +898,7 @@ st.sidebar.subheader("API & Data Connections")
 st.sidebar.markdown(f"{'🟢' if API_FOOTBALL_KEY else '🔴'} API-Football")
 st.sidebar.markdown(f"{'🟢' if FOOTBALL_DATA_KEY else '🔴'} football-data.org")
 st.sidebar.markdown(f"{'🟢' if THE_ODDS_API_KEY else '🔴'} The Odds API")
-st.sidebar.markdown("🟢 Historical CSV Engine (Football-Data.co.uk, no key needed)")
+st.sidebar.markdown("🟢 Historical CSV Engine (Football-Data.co.uk)")
 st.sidebar.markdown("🟢 Open-Meteo Weather")
 
 if st.sidebar.button("🔄 Refresh Rosters & Live Stats", use_container_width=True):
@@ -888,7 +918,7 @@ home_team, away_team, kickoff = match_row["home_team"], match_row["away_team"], 
 st.sidebar.divider()
 st.sidebar.subheader("Trading Parameters")
 target_margin = st.sidebar.slider("Target Model Margin (%)", 2.0, 8.0, 5.0, 0.5)
-kelly_fraction = st.sidebar.slider("Kelly Fractional Sizing", 0.1, 1.0, 0.25, 0.05, help="0.25 = Quarter Kelly (Recommended)")
+kelly_fraction = st.sidebar.slider("Kelly Fractional Sizing", 0.1, 1.0, 0.25, 0.05, help="0.25 = Quarter Kelly")
 
 st.sidebar.subheader("Rest Differential (Days Rest)")
 c_r1, c_r2 = st.sidebar.columns(2)
@@ -901,19 +931,47 @@ with c_r2:
 st.sidebar.divider()
 st.sidebar.subheader("🔬 Advanced Modifiers")
 
-with st.sidebar.expander("1. xG Regression (Finishing Luck)", expanded=False):
-    st.caption("Adjusts expected goals for over/under-performing shooting efficiency.")
-    c_x1, c_x2 = st.columns(2)
-    with c_x1:
-        h_xg_c = st.number_input(f"{home_team} Created xG", value=1.50, step=0.10)
-        h_act_g = st.number_input(f"{home_team} Actual Goals", value=1.50, step=0.10)
-    with c_x2:
-        a_xg_c = st.number_input(f"{away_team} Created xG", value=1.20, step=0.10)
-        a_act_g = st.number_input(f"{away_team} Actual Goals", value=1.20, step=0.10)
+with st.sidebar.expander("1. xG Regression & Opponent Strength", expanded=False):
+    st.caption("Adjusts for finishing/goalkeeping variance and opponent Strength of Schedule (SoS).")
     
-    h_xg_reg_mult = ((h_xg_c * 0.70) + (h_act_g * 0.30)) / h_xg_c if h_xg_c > 0 else 1.0
-    a_xg_reg_mult = ((a_xg_c * 0.70) + (a_act_g * 0.30)) / a_xg_c if a_xg_c > 0 else 1.0
-    st.caption(f"Multiplier: Home **{h_xg_reg_mult:.2f}x** | Away **{a_xg_reg_mult:.2f}x**")
+    st.markdown("**Home Team (Recent Form)**")
+    c_h1, c_h2, c_h3 = st.columns(3)
+    with c_h1:
+        h_gf = st.number_input(f"{home_team} GF", value=1.5, step=0.1)
+        h_xgf = st.number_input(f"{home_team} xGF", value=1.5, step=0.1)
+    with c_h2:
+        h_ga = st.number_input(f"{home_team} GA", value=1.2, step=0.1)
+        h_xga = st.number_input(f"{home_team} xGA", value=1.2, step=0.1)
+    with c_h3:
+        h_opp_def = st.number_input("Opp Avg Def (β)", value=1.00, step=0.05, key="h_opp_d")
+        h_opp_att = st.number_input("Opp Avg Att (α)", value=1.00, step=0.05, key="h_opp_a")
+
+    st.markdown("**Away Team (Recent Form)**")
+    c_a1, c_a2, c_a3 = st.columns(3)
+    with c_a1:
+        a_gf = st.number_input(f"{away_team} GF", value=1.2, step=0.1)
+        a_xgf = st.number_input(f"{away_team} xGF", value=1.2, step=0.1)
+    with c_a2:
+        a_ga = st.number_input(f"{away_team} GA", value=1.5, step=0.1)
+        a_xga = st.number_input(f"{away_team} xGA", value=1.5, step=0.1)
+    with c_a3:
+        a_opp_def = st.number_input("Opp Avg Def (β)", value=1.00, step=0.05, key="a_opp_d")
+        a_opp_att = st.number_input("Opp Avg Att (α)", value=1.00, step=0.05, key="a_opp_a")
+
+    # Opponent-Adjusted True xG
+    h_true_xgf = h_xgf / h_opp_def if h_opp_def > 0 else h_xgf
+    h_true_xga = h_xga / h_opp_att if h_opp_att > 0 else h_xga
+    a_true_xgf = a_xgf / a_opp_def if a_opp_def > 0 else a_xgf
+    a_true_xga = a_xga / a_opp_att if a_opp_att > 0 else a_xga
+
+    # 70/30 Regression Multipliers
+    h_att_reg_mult = ((h_true_xgf * 0.70) + (h_gf * 0.30)) / h_xgf if h_xgf > 0 else 1.0
+    h_def_reg_mult = ((h_true_xga * 0.70) + (h_ga * 0.30)) / h_xga if h_xga > 0 else 1.0
+    a_att_reg_mult = ((a_true_xgf * 0.70) + (a_gf * 0.30)) / a_xgf if a_xgf > 0 else 1.0
+    a_def_reg_mult = ((a_true_xga * 0.70) + (a_ga * 0.30)) / a_xga if a_xga > 0 else 1.0
+
+    st.caption(f"**{home_team} Modifiers:** Attack **{h_att_reg_mult:.2f}x** | Defense **{h_def_reg_mult:.2f}x**")
+    st.caption(f"**{away_team} Modifiers:** Attack **{a_att_reg_mult:.2f}x** | Defense **{a_def_reg_mult:.2f}x**")
 
 with st.sidebar.expander("2. Tactical Pressing (PPDA & Tilt)", expanded=False):
     st.caption("High-pressing teams get an attack rating boost based on Field Tilt.")
@@ -923,8 +981,7 @@ with st.sidebar.expander("2. Tactical Pressing (PPDA & Tilt)", expanded=False):
     with c_p2:
         a_ppda = st.number_input(f"{away_team} PPDA", value=12.0, step=0.5)
     
-    tilt_diff = st.number_input("Field Tilt Diff (%)", value=0.0, step=1.0, help="Positive = Home dominance, Negative = Away dominance")
-    
+    tilt_diff = st.number_input("Field Tilt Diff (%)", value=0.0, step=1.0)
     press_edge_h = a_ppda / h_ppda if h_ppda > 0 else 1.0
     press_edge_a = h_ppda / a_ppda if a_ppda > 0 else 1.0
     
@@ -938,24 +995,29 @@ with st.sidebar.expander("3. Travel Distance & Fatigue", expanded=False):
     away_travel_mult = max(0.90, 1.0 - (away_travel_km / 25000.0))
     st.caption(f"Away Travel Penalty: **{away_travel_mult:.2f}x**")
 
-with st.sidebar.expander("6. Referee Strictness", expanded=False):
-    st.caption("Adjusts the Dixon-Coles ρ (low-score dependency) for red card probabilities.")
-    c_r1, c_r2 = st.columns(2)
-    with c_r1:
-        ref_cards = st.number_input("Referee Avg Cards", value=4.0, step=0.1)
-    with c_r2:
-        league_cards = st.number_input("League Avg Cards", value=4.0, step=0.1)
+with st.sidebar.expander("6. Cards & Referee Strictness", expanded=False):
+    st.caption("Foul rates impact the likelihood of red cards, scaling the Dixon-Coles ρ parameter.")
+    league_defaults = LEAGUE_DISCIPLINE_STATS.get(league, {"avg_fouls": 22.0, "avg_cards": 4.5})
+    
+    c_rc1, c_rc2 = st.columns(2)
+    with c_rc1:
+        h_fouls = st.number_input("Home Avg Fouls", value=11.0, step=0.5)
+        ref_cards = st.number_input("Referee Avg Cards", value=league_defaults["avg_cards"], step=0.1)
+    with c_rc2:
+        a_fouls = st.number_input("Away Avg Fouls", value=11.0, step=0.5)
+        league_cards = st.number_input("League Avg Cards", value=league_defaults["avg_cards"], step=0.1)
         
-    ref_strictness = ref_cards / league_cards if league_cards > 0 else 1.0
+    expected_cards = ref_cards * ((h_fouls + a_fouls) / league_defaults["avg_fouls"])
+    ref_strictness = expected_cards / league_cards if league_cards > 0 else 1.0
     base_rho = -0.06
     adjusted_rho = base_rho * ref_strictness
-    st.caption(f"Strictness Ratio: **{ref_strictness:.2f}x** | Adjusted Dixon-Coles ρ: **{adjusted_rho:.3f}**")
+    st.caption(f"Expected Match Cards: **{expected_cards:.1f}** | Adjusted Dixon-Coles ρ: **{adjusted_rho:.3f}**")
 
 st.sidebar.divider()
 st.sidebar.subheader("Player Availability")
 rating_window = st.sidebar.slider(
     "Player Form Window (games)", 3, 5, 5,
-    help="avg_rating below is each player's average rating over their last N matches (not season average) — the number to check for who's actually in form right now."
+    help="avg_rating below is each player's average rating over their last N matches."
 )
 home_squad_raw = fetch_squad(home_team, seed_offset=1, n_games=rating_window)
 away_squad_raw = fetch_squad(away_team, seed_offset=2, n_games=rating_window)
@@ -973,15 +1035,13 @@ city, lat, lon = _STADIUM_CITIES.get(league, ("London", 51.5072, -0.1276))
 weather = fetch_weather(lat, lon, kickoff)
 w_mult = weather_modifier(weather)
 
-# Dual-layer Lambda Computation: Prefer multi-season historical CSV dataset, fallback to standings
 hist_code = HIST_LEAGUE_MAP.get(league, "E0")
 hist_df = fetch_historical_league_data(hist_code)
 secondary_code = HIST_SECONDARY_LEAGUE_MAP.get(hist_code)
 secondary_hist_df = fetch_historical_league_data(secondary_code) if secondary_code else pd.DataFrame()
 
 lambda_source = "mock"
-home_tier_info = away_tier_info = {"tier": "n/a", "n": 0, "attack": 1.0, "defense": 1.0,
-                                     "goals_for": None, "goals_against": None}
+home_tier_info = away_tier_info = {"tier": "n/a", "n": 0, "attack": 1.0, "defense": 1.0, "goals_for": None, "goals_against": None}
 league_home_avg_used = league_away_avg_used = 1.55
 
 if not hist_df.empty:
@@ -1005,28 +1065,22 @@ rating_mode = st.sidebar.radio(
     "Rating Mode",
     options=["Automated (Data-Driven)", "Custom Manual Override"],
     index=0,
-    help="Automated uses whichever source produced the values above. Custom lets you type in your own attack/defense ratings.",
 )
 
 def _overall_rating(attack: float, defense: float) -> float:
     return round(min(max(50 + (attack - defense) * 25, 0), 100), 1)
 
-st.sidebar.caption(
-    f"{home_team}: {home_tier_info['tier']}" + (f" ({home_tier_info['n']} matches)" if home_tier_info.get('n') else "")
-    + f" · {away_team}: {away_tier_info['tier']}" + (f" ({away_tier_info['n']} matches)" if away_tier_info.get('n') else "")
-)
+st.sidebar.caption(f"{home_team}: {home_tier_info['tier']} · {away_team}: {away_tier_info['tier']}")
 
 if rating_mode == "Automated (Data-Driven)":
-    st.sidebar.success("🟢 Ratings auto-synced from the data source above")
+    st.sidebar.success("🟢 Ratings auto-synced from data source")
     col1, col2 = st.sidebar.columns(2)
     with col1:
         st.metric(f"{home_team} α (Att)", home_tier_info["attack"])
         st.metric(f"{home_team} β (Def)", home_tier_info["defense"])
-        st.metric(f"{home_team} Overall", f"{_overall_rating(home_tier_info['attack'], home_tier_info['defense'])}/100")
     with col2:
         st.metric(f"{away_team} α (Att)", away_tier_info["attack"])
         st.metric(f"{away_team} β (Def)", away_tier_info["defense"])
-        st.metric(f"{away_team} Overall", f"{_overall_rating(away_tier_info['attack'], away_tier_info['defense'])}/100")
 
     home_attack_eff, home_defense_eff = home_tier_info["attack"], home_tier_info["defense"]
     away_attack_eff, away_defense_eff = away_tier_info["attack"], away_tier_info["defense"]
@@ -1036,41 +1090,43 @@ else:
     c1, c2 = st.sidebar.columns(2)
     with c1:
         st.markdown(f"**{home_team}**")
-        home_attack_eff = st.number_input("Attack (α)", 0.10, 3.00, value=float(home_tier_info["attack"]), step=0.05, key="home_attack_custom")
-        home_defense_eff = st.number_input("Defense (β)", 0.10, 3.00, value=float(home_tier_info["defense"]), step=0.05, key="home_defense_custom")
-        st.caption(f"Overall: **{_overall_rating(home_attack_eff, home_defense_eff)}/100**")
+        home_attack_eff = st.number_input("Attack (α)", 0.10, 3.00, value=float(home_tier_info["attack"]), step=0.05, key="h_att_c")
+        home_defense_eff = st.number_input("Defense (β)", 0.10, 3.00, value=float(home_tier_info["defense"]), step=0.05, key="h_def_c")
     with c2:
         st.markdown(f"**{away_team}**")
-        away_attack_eff = st.number_input("Attack (α)", 0.10, 3.00, value=float(away_tier_info["attack"]), step=0.05, key="away_attack_custom")
-        away_defense_eff = st.number_input("Defense (β)", 0.10, 3.00, value=float(away_tier_info["defense"]), step=0.05, key="away_defense_custom")
-        st.caption(f"Overall: **{_overall_rating(away_attack_eff, away_defense_eff)}/100**")
+        away_attack_eff = st.number_input("Attack (α)", 0.10, 3.00, value=float(away_tier_info["attack"]), step=0.05, key="a_att_c")
+        away_defense_eff = st.number_input("Defense (β)", 0.10, 3.00, value=float(away_tier_info["defense"]), step=0.05, key="a_def_c")
     ratings_overridden = True
 
 if ratings_overridden:
     base_lam_home = round(league_home_avg_used * home_attack_eff * away_defense_eff, 3)
     base_lam_away = round(league_away_avg_used * away_attack_eff * home_defense_eff, 3)
-    lambda_source += " + custom manual override"
 
 home_form_df = fetch_team_form(home_team, league)
 away_form_df = fetch_team_form(away_team, league)
 
-home_piv_mult, home_squad = player_impact_score(home_squad_raw, home_active)
-away_piv_mult, away_squad = player_impact_score(away_squad_raw, away_active)
+home_is_promoted = home_tier_info.get("tier") == "second-tier (promotion-adjusted)"
+away_is_promoted = away_tier_info.get("tier") == "second-tier (promotion-adjusted)"
+
+home_piv_mult, home_squad = player_impact_score(home_squad_raw, home_active, is_facing_promoted=away_is_promoted, is_promoted_team=home_is_promoted)
+away_piv_mult, away_squad = player_impact_score(away_squad_raw, away_active, is_facing_promoted=home_is_promoted, is_promoted_team=away_is_promoted)
 
 home_model = TeamModelInputs(
     name=home_team, base_lambda=base_lam_home, piv_multiplier=home_piv_mult,
     form_mult=form_multiplier(home_form_df), form_rating=team_form_rating_0_100(home_form_df),
     weather_mult=w_mult, rest_mult=rest_modifier(home_rest), 
-    xg_reg_mult=h_xg_reg_mult, press_mult=h_press_mult, travel_mult=1.0,
-    squad_table=home_squad,
+    xg_att_reg_mult=h_att_reg_mult, 
+    xg_def_reg_mult_opponent=a_def_reg_mult, # Cross-pollinated defense multiplier
+    press_mult=h_press_mult, travel_mult=1.0, squad_table=home_squad,
 )
 
 away_model = TeamModelInputs(
     name=away_team, base_lambda=base_lam_away, piv_multiplier=away_piv_mult,
     form_mult=form_multiplier(away_form_df), form_rating=team_form_rating_0_100(away_form_df),
     weather_mult=w_mult, rest_mult=rest_modifier(away_rest), 
-    xg_reg_mult=a_xg_reg_mult, press_mult=a_press_mult, travel_mult=away_travel_mult,
-    squad_table=away_squad,
+    xg_att_reg_mult=a_att_reg_mult, 
+    xg_def_reg_mult_opponent=h_def_reg_mult, # Cross-pollinated defense multiplier
+    press_mult=a_press_mult, travel_mult=away_travel_mult, squad_table=away_squad,
 )
 
 lam_home, lam_away = home_model.lambda_final, away_model.lambda_final
@@ -1088,39 +1144,17 @@ model_odds_btts = apply_margin({"btts_yes": model_probs["btts_yes"], "btts_no": 
 st.title(f"{home_team} vs {away_team}")
 st.caption(f"{league} · Kickoff {kickoff.strftime('%A %d %B, %H:%M')} · Venue: {city}")
 
-def _tier_warning(team_name: str, info: dict) -> Optional[str]:
-    if info["tier"] == "second-tier (promotion-adjusted)":
-        return (f"ℹ️ {team_name} has no top-flight matches in the scanned window (likely newly promoted) — "
-                f"using their last {info['n']} second-tier matches with a promotion adjustment "
-                f"(attack ×{PROMOTION_ATTACK_DISCOUNT}, defense ×{PROMOTION_DEFENSE_PENALTY}) instead of "
-                f"the raw league average.")
-    if info["tier"] == "no match — league average":
-        return (f"⚠️ Couldn't find {team_name} in the top-flight OR second-tier data for the scanned window — "
-                f"using the 1.0 league-average fallback. If this team should have data, check "
-                f"`HIST_TEAM_ALIASES` for a naming mismatch.")
-    return None
-
 if "historical CSV" in lambda_source:
-    for _team, _info in ((home_team, home_tier_info), (away_team, away_tier_info)):
-        _msg = _tier_warning(_team, _info)
-        if _msg:
-            if "⚠️" in _msg:
-                st.warning(_msg)
-            else:
-                st.info(_msg)
-
-tier_summary = ""
-if "historical CSV" in lambda_source:
-    tier_summary = f" · {home_team}: {home_tier_info['tier']} ({home_tier_info['n']} matches) · {away_team}: {away_tier_info['tier']} ({away_tier_info['n']} matches)"
-st.caption(f"λ base source: **{lambda_source}**{tier_summary}")
+    tier_msg = f" · {home_team}: {home_tier_info['tier']} · {away_team}: {away_tier_info['tier']}"
+    st.caption(f"λ base source: **{lambda_source}**{tier_msg}")
 
 c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.metric("λ Home (Final xG)", lam_home)
-    st.caption(f"Base {base_lam_home} → PIV×{home_piv_mult:.2f} · Rest×{home_model.rest_mult:.2f} · Reg×{h_xg_reg_mult:.2f} · Press×{h_press_mult:.2f}")
+    st.caption(f"Base {base_lam_home} → PIV×{home_piv_mult:.2f} · Reg×{h_att_reg_mult:.2f} (Att) / {a_def_reg_mult:.2f} (Opp Def) · Press×{h_press_mult:.2f}")
 with c2:
     st.metric("λ Away (Final xG)", lam_away)
-    st.caption(f"Base {base_lam_away} → PIV×{away_piv_mult:.2f} · Rest×{away_model.rest_mult:.2f} · Reg×{a_xg_reg_mult:.2f} · Press×{a_press_mult:.2f} · Trvl×{away_travel_mult:.2f}")
+    st.caption(f"Base {base_lam_away} → PIV×{away_piv_mult:.2f} · Reg×{a_att_reg_mult:.2f} (Att) / {h_def_reg_mult:.2f} (Opp Def) · Trvl×{away_travel_mult:.2f}")
 with c3:
     st.metric(f"{home_team} Form", f"{home_model.form_rating}/100")
     st.metric(f"{away_team} Form", f"{away_model.form_rating}/100")
@@ -1128,115 +1162,25 @@ with c4:
     st.metric("🌡️ Temp", f"{weather['temperature_c']}°C")
     st.metric("💨 Wind", f"{weather['wind_speed_kmh']} km/h")
 
-# ---- Rating Calculation Breakdown ----
-with st.expander("📊 Rating Calculation Breakdown"):
-    primary_league_name = league
-    secondary_league_name = SECOND_TIER_DISPLAY_NAMES.get(secondary_code, secondary_code or "n/a")
-
-    summary_rows = []
-    for team_name, info in ((home_team, home_tier_info), (away_team, away_tier_info)):
-        if info["tier"] == "second-tier (promotion-adjusted)":
-            summary_rows.append({
-                "Team": team_name, "League Context": f"{secondary_league_name} Baseline",
-                "Attack Rating (α)": info["raw_attack"], "Defense Rating (β)": info["raw_defense"],
-            })
-            summary_rows.append({
-                "Team": team_name, "League Context": f"{primary_league_name} Adjusted",
-                "Attack Rating (α)": info["attack"], "Defense Rating (β)": info["defense"],
-            })
-        elif info["tier"] == "top-flight":
-            summary_rows.append({
-                "Team": team_name, "League Context": f"{primary_league_name} Baseline",
-                "Attack Rating (α)": info["attack"], "Defense Rating (β)": info["defense"],
-            })
-        else:
-            summary_rows.append({
-                "Team": team_name, "League Context": f"League Average ({info['tier']})",
-                "Attack Rating (α)": info["attack"], "Defense Rating (β)": info["defense"],
-            })
-
-    st.markdown("**Rating Summary Table**")
-    st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
-
-    st.markdown("**Key Metric Explanations**")
-    for team_name, info in ((home_team, home_tier_info), (away_team, away_tier_info)):
-        if info["tier"] == "second-tier (promotion-adjusted)":
-            att_pct = round((info["raw_attack"] - 1) * 100, 1)
-            def_pct = round((1 - info["raw_defense"]) * 100, 1)
-            st.markdown(
-                f"- **{team_name} ({secondary_league_name} raw)** — Attack (α={info['raw_attack']}): "
-                f"{'generates ' + str(abs(att_pct)) + '% more' if att_pct >= 0 else 'generates ' + str(abs(att_pct)) + '% less'} "
-                f"xG than a standard {secondary_league_name} team. "
-                f"Defense (β={info['raw_defense']}): concedes "
-                f"{'fewer' if def_pct >= 0 else 'more'} goals than average ({abs(def_pct)}% {'below' if def_pct>=0 else 'above'} the {secondary_league_name} mean)."
-            )
-            st.markdown(
-                f"- **{team_name} ({primary_league_name} adjusted)** — applied cross-tier translation "
-                f"(attack ×{PROMOTION_ATTACK_DISCOUNT}, defense ×{PROMOTION_DEFENSE_PENALTY}, "
-                f"a heuristic prior, not fitted to this data): "
-                f"α = {info['raw_attack']} × {PROMOTION_ATTACK_DISCOUNT} → **{info['attack']}**, "
-                f"β = {info['raw_defense']} × {PROMOTION_DEFENSE_PENALTY} → **{info['defense']}**."
-            )
-        elif info["tier"] == "top-flight":
-            st.markdown(
-                f"- **{team_name}** — Attack (α={info['attack']}): "
-                f"{'generates' if info['attack']>=1 else 'produces'} {abs(round((info['attack']-1)*100,1))}% "
-                f"{'more' if info['attack']>=1 else 'less'} xG than a standard {primary_league_name} team. "
-                f"Defense (β={info['defense']}): concedes {abs(round((info['defense']-1)*100,1))}% "
-                f"{'less' if info['defense']<1 else 'more'} than the {primary_league_name} average "
-                f"(across {info['n']} matches)."
-            )
-        else:
-            st.markdown(f"- **{team_name}** — no usable match data in either tier; using the neutral league-average fallback (α=1.0, β=1.0).")
-
-    st.markdown("**How These Metrics Combine in the Poisson Match Model**")
-    st.markdown(
-        f"Using this fixture's actual baselines (Home Avg Goals = {league_home_avg_used}, "
-        f"Away Avg Goals = {league_away_avg_used}):"
-    )
-    st.latex(
-        rf"\lambda_H = {league_home_avg_used} \times {home_tier_info['attack']} \times {away_tier_info['defense']} "
-        rf"\approx {round(league_home_avg_used * home_tier_info['attack'] * away_tier_info['defense'], 3)}\ \text{{xG}}"
-    )
-    st.latex(
-        rf"\lambda_A = {league_away_avg_used} \times {away_tier_info['attack']} \times {home_tier_info['defense']} "
-        rf"\approx {round(league_away_avg_used * away_tier_info['attack'] * home_tier_info['defense'], 3)}\ \text{{xG}}"
-    )
-    st.caption(
-        "These are the BASE λ values. Modifiers like regression, pressing tilt, rest, and travel distance are applied directly in final computation calculations."
-    )
-
 st.divider()
 
-# ---- Squad & Player Form Section ----
 st.subheader("👥 Player Form & Impact Penalties")
-st.caption(f"avg_rating and games_rated reflect each player's actual performance over their last {rating_window} matches "
-           f"(not season average) — games_rated = 0 means they haven't featured in that recent window.")
 home_squad_source = home_squad["data_source"].iloc[0] if "data_source" in home_squad.columns and len(home_squad) else "unknown"
 away_squad_source = away_squad["data_source"].iloc[0] if "data_source" in away_squad.columns and len(away_squad) else "unknown"
-if "Mock" in home_squad_source or "Mock" in away_squad_source:
-    st.warning(f"⚠️ Squad data source — {home_team}: **{home_squad_source}** · {away_team}: **{away_squad_source}**")
-else:
-    st.caption(f"Squad data source — {home_team}: **{home_squad_source}** · {away_team}: **{away_squad_source}**")
+st.caption(f"Squad data source — {home_team}: **{home_squad_source}** · {away_team}: **{away_squad_source}**")
+
 pc1, pc2 = st.columns(2)
 display_cols = ["player", "position", "avg_rating", "games_rated", "xG90", "xA90", "status", "absence_penalty_%"]
 with pc1:
     st.markdown(f"**{home_team} Lineup & Stats**")
-    st.dataframe(
-        home_squad[display_cols].sort_values("avg_rating", ascending=False, na_position="last"),
-        hide_index=True,
-    )
+    st.dataframe(home_squad[display_cols].sort_values("avg_rating", ascending=False, na_position="last"), hide_index=True)
 with pc2:
     st.markdown(f"**{away_team} Lineup & Stats**")
-    st.dataframe(
-        away_squad[display_cols].sort_values("avg_rating", ascending=False, na_position="last"),
-        hide_index=True,
-    )
+    st.dataframe(away_squad[display_cols].sort_values("avg_rating", ascending=False, na_position="last"), hide_index=True)
 
 st.divider()
 
-# ---- Quantitative Odds & Devigged Market Comparison ----
-st.subheader("💰 Odds Engine, Devigged Market & Kelly Staking")
+st.subheader("💰 Odds Engine, Consensus Market & Kelly Staking")
 
 book_1x2 = market_odds.get("1X2", {})
 devig_1x2 = devig_proportional(book_1x2.get("home", 0), book_1x2.get("draw", 0), book_1x2.get("away", 0))
@@ -1245,7 +1189,7 @@ devig_btts = devig_two_way(market_odds.get("btts_yes"), market_odds.get("btts_no
 
 def build_trade_row(market_label, model_prob, model_odd, book_odd, fair_mkt_prob):
     if not book_odd or book_odd <= 1.0:
-        return {"Market": market_label, "Model Odds": model_odd, "Bookmaker Odds": "N/A", "Edge (pp)": 0, "Kelly Stake": "0.0%", "Signal": "N/A"}
+        return {"Market": market_label, "Model Odds": model_odd, "Consensus Odds": "N/A", "Edge (pp)": 0, "Kelly Stake": "0.0%", "Signal": "N/A"}
 
     devigged = True
     if fair_mkt_prob is None:
@@ -1255,16 +1199,14 @@ def build_trade_row(market_label, model_prob, model_odd, book_odd, fair_mkt_prob
     edge_pp = round((model_prob - fair_mkt_prob) * 100, 2)
     stake_pct = kelly_stake(model_prob, book_odd, kelly_fraction)
 
-    if not devigged:
-        signal = "⚠️ NO DEVIG"
-    else:
-        signal = "🟢 VALUE" if edge_pp >= 2.0 and stake_pct > 0 else ("🔴 OVERPRICED" if edge_pp <= -2.0 else "⚪ FAIR")
+    if not devigged: signal = "⚠️ NO DEVIG"
+    else: signal = "🟢 VALUE" if edge_pp >= 2.0 and stake_pct > 0 else ("🔴 OVERPRICED" if edge_pp <= -2.0 else "⚪ FAIR")
 
     return {
         "Market": market_label,
         "Model Prob %": round(model_prob * 100, 1),
         "Model Odds": model_odd,
-        "Bookmaker Odds": book_odd,
+        "Consensus Odds": book_odd,
         "Fair Market Prob %": round(fair_mkt_prob * 100, 1),
         "Edge (pp)": edge_pp,
         "Kelly Stake %": f"{stake_pct}%",
@@ -1284,47 +1226,19 @@ trade_rows = [
     build_trade_row("BTTS — Yes", model_probs["btts_yes"], model_odds_btts["btts_yes"], market_odds.get("btts_yes"), fair_btts_yes),
 ]
 
-comparison_df = pd.DataFrame(trade_rows)
-st.dataframe(comparison_df, hide_index=True)
-st.caption("Edge (pp) = Model Probability − Devigged (Fair) Market Probability. Fractional Kelly sizing calculated using specified bankroll multiplier.")
+st.dataframe(pd.DataFrame(trade_rows), hide_index=True)
+if market_odds.get("source"): st.caption(f"Odds Source: {market_odds['source']}")
 
 st.divider()
 
-# ---- Heatmap Section ----
 st.subheader("🔥 Scoreline Probability Matrix Heatmap")
-
 heat_labels = list(range(matrix.shape[0]))
 fig = go.Figure(data=go.Heatmap(
-    z=matrix * 100,
-    x=[f"{away_team} {g}" for g in heat_labels],
-    y=[f"{home_team} {g}" for g in heat_labels],
-    colorscale="YlOrRd",
-    text=np.round(matrix * 100, 1),
-    texttemplate="%{text}%",
-    textfont={"size": 11},
-    hoverongaps=False
+    z=matrix * 100, x=[f"{away_team} {g}" for g in heat_labels], y=[f"{home_team} {g}" for g in heat_labels],
+    colorscale="YlOrRd", text=np.round(matrix * 100, 1), texttemplate="%{text}%", textfont={"size": 11}, hoverongaps=False
 ))
-
 fig.update_layout(
-    title=f"Scoreline Probability Distribution (%) — Combined xG Expectancy: {lam_home + lam_away:.2f}",
-    xaxis_title=f"Away Goals ({away_team})",
-    yaxis_title=f"Home Goals ({home_team})",
-    height=500,
-    margin=dict(l=40, r=40, t=50, b=40)
+    title=f"Scoreline Probability Distribution (%) — Adjusted Dixon-Coles ρ: {adjusted_rho:.4f}",
+    xaxis_title=f"Away Goals ({away_team})", yaxis_title=f"Home Goals ({home_team})", height=500, margin=dict(l=40, r=40, t=50, b=40)
 )
-
 st.plotly_chart(fig)
-
-st.divider()
-st.subheader("📥 Export Analysis")
-
-@st.cache_data
-def convert_df_to_csv(df: pd.DataFrame):
-    return df.to_csv(index=False).encode('utf-8')
-
-st.download_button(
-    label="Download Odds & Edge Analysis (CSV)",
-    data=convert_df_to_csv(comparison_df),
-    file_name=f"{home_team}_vs_{away_team}_odds_analysis.csv",
-    mime="text/csv",
-)
