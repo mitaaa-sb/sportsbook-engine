@@ -152,10 +152,8 @@ def normalize_team_name(name: str) -> str:
     if not name:
         return ""
     n = name.strip()
-    
     suffixes = [" Football Club", " FC", " CF", " AFC", " SC", " SV"]
     prefixes = ["AFC ", "FC ", "CF ", "SC ", "SV "]
-    
     for p in prefixes:
         if n.startswith(p):
             n = n[len(p):].strip()
@@ -165,7 +163,6 @@ def normalize_team_name(name: str) -> str:
             
     clean_key = n.lower().replace("-", " ").replace("'", "").strip()
     return HIST_TEAM_ALIASES.get(clean_key, n).strip()
-
 
 def api_search_name(name: str) -> str:
     if not name:
@@ -192,16 +189,13 @@ def is_team_match(name1: str, name2: str) -> bool:
             return True
     return False
 
-
 def _current_season_year() -> int:
     now = dt.datetime.now()
     return now.year if now.month >= 7 else now.year - 1
 
-
 def _recent_hist_season_codes(n: int = 3) -> list:
     start_year = _current_season_year()
     return [f"{str(y)[-2:]}{str(y + 1)[-2:]}" for y in range(start_year - n + 1, start_year + 1)]
-
 
 # ====================================================================================
 # 2. HISTORICAL DATA ENGINE (MULTI-SEASON ARCHIVE)
@@ -210,7 +204,6 @@ def _recent_hist_season_codes(n: int = 3) -> list:
 def fetch_historical_league_data(league_code: str = "E0") -> pd.DataFrame:
     seasons = _recent_hist_season_codes(3)
     dfs = []
-    
     for s in seasons:
         url = f"https://www.football-data.co.uk/mmz4281/{s}/{league_code}.csv"
         try:
@@ -221,37 +214,27 @@ def fetch_historical_league_data(league_code: str = "E0") -> pd.DataFrame:
             dfs.append(df_clean)
         except Exception:
             continue
-
     if dfs:
         combined = pd.concat(dfs, ignore_index=True)
         combined['Date'] = pd.to_datetime(combined['Date'], dayfirst=True, errors='coerce')
         return combined.sort_values('Date', ascending=False)
-    
     return pd.DataFrame()
-
 
 def _match_hist_team_rows(hist_df: pd.DataFrame, column: str, team_name: str) -> pd.DataFrame:
     if hist_df.empty or column not in hist_df.columns:
         return hist_df.iloc[0:0]
-
     target_norm = normalize_team_name(team_name).casefold()
     col = hist_df[column].astype(str)
-
     exact = hist_df[col.apply(lambda c: normalize_team_name(c).casefold() == target_norm)]
     if not exact.empty:
         return exact
-
     candidates = col.unique()
     hits = [c for c in candidates if is_team_match(c, team_name)]
     if len(hits) == 1:
         return hist_df[col == hits[0]]
-
     return hist_df.iloc[0:0]
 
-
-def _team_hist_side_stats(team_name: str, side: str, primary_df: pd.DataFrame,
-                           secondary_df: Optional[pd.DataFrame],
-                           league_home_avg_g: float, league_away_avg_g: float) -> dict:
+def _team_hist_side_stats(team_name: str, side: str, primary_df: pd.DataFrame, secondary_df: Optional[pd.DataFrame], league_home_avg_g: float, league_away_avg_g: float) -> dict:
     team_col = 'HomeTeam' if side == 'home' else 'AwayTeam'
     for_col = 'FTHG' if side == 'home' else 'FTAG'
     against_col = 'FTAG' if side == 'home' else 'FTHG'
@@ -289,13 +272,8 @@ def _team_hist_side_stats(team_name: str, side: str, primary_df: pd.DataFrame,
             "tier": "no match — league average", "n": 0,
             "raw_attack": None, "raw_defense": None, "raw_goals_for": None, "raw_goals_against": None}
 
-
-def calculate_historical_lambdas(
-    home_team: str, away_team: str, hist_df: pd.DataFrame,
-    secondary_df: Optional[pd.DataFrame] = None,
-) -> Tuple[float, float, dict, dict, float, float]:
-    empty_keys = {"attack": 1.0, "defense": 1.0, "raw_attack": None, "raw_defense": None,
-                  "raw_goals_for": None, "raw_goals_against": None, "goals_for": None, "goals_against": None}
+def calculate_historical_lambdas(home_team: str, away_team: str, hist_df: pd.DataFrame, secondary_df: Optional[pd.DataFrame] = None) -> Tuple[float, float, dict, dict, float, float]:
+    empty_keys = {"attack": 1.0, "defense": 1.0, "raw_attack": None, "raw_defense": None, "raw_goals_for": None, "raw_goals_against": None, "goals_for": None, "goals_against": None}
     if hist_df.empty:
         empty_info = {**empty_keys, "tier": "no historical data", "n": 0}
         return 1.55, 1.20, empty_info, empty_info, 1.55, 1.20
@@ -309,37 +287,42 @@ def calculate_historical_lambdas(
     lam_home = league_home_avg_g * home_info["attack"] * away_info["defense"]
     lam_away = league_away_avg_g * away_info["attack"] * home_info["defense"]
 
-    return (round(float(lam_home), 3), round(float(lam_away), 3), home_info, away_info,
-            round(float(league_home_avg_g), 3), round(float(league_away_avg_g), 3))
+    return (round(float(lam_home), 3), round(float(lam_away), 3), home_info, away_info, round(float(league_home_avg_g), 3), round(float(league_away_avg_g), 3))
 
 def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matches: int = 5) -> dict:
-    default_res = {"gf": 1.5, "xgf": 1.5, "ga": 1.2, "xga": 1.2, "opp_def": 1.00, "opp_att": 1.00, "season_gf": 1.5, "season_ga": 1.5}
+    default_res = {"gf": 1.5, "xgf": 1.5, "ga": 1.2, "xga": 1.2, "opp_def": 1.00, "opp_att": 1.00, "season_xgf": 1.5, "season_xga": 1.2}
     if hist_df.empty: return default_res
 
     league_h_g = max(hist_df['FTHG'].mean(), 1.0)
     league_a_g = max(hist_df['FTAG'].mean(), 1.0)
 
+    # 1. LONG-TERM SEASON AVERAGES (Calculated in Proxy-xG units for consistent scale)
     home_all = _match_hist_team_rows(hist_df, 'HomeTeam', team_name).head(38)
     away_all = _match_hist_team_rows(hist_df, 'AwayTeam', team_name).head(38)
     
-    gf_all, ga_all = [], []
-    if not home_all.empty:
-        gf_all.extend(home_all['FTHG'].tolist())
-        ga_all.extend(home_all['FTAG'].tolist())
-    if not away_all.empty:
-        gf_all.extend(away_all['FTAG'].tolist())
-        ga_all.extend(away_all['FTHG'].tolist())
+    xgf_all, xga_all = [], []
+    for _, row in home_all.iterrows():
+        hs, hst = row.get('HS', 10.0), row.get('HST', 3.5)
+        as_, ast = row.get('AS', 10.0), row.get('AST', 3.5)
+        xgf_all.append(0.32 * hst + 0.03 * max(0, hs - hst))
+        xga_all.append(0.32 * ast + 0.03 * max(0, as_ - ast))
+    for _, row in away_all.iterrows():
+        hs, hst = row.get('HS', 10.0), row.get('HST', 3.5)
+        as_, ast = row.get('AS', 10.0), row.get('AST', 3.5)
+        xgf_all.append(0.32 * ast + 0.03 * max(0, as_ - ast))
+        xga_all.append(0.32 * hst + 0.03 * max(0, hs - hst))
         
-    season_gf = round(float(np.mean(gf_all)), 2) if gf_all else league_h_g
-    season_ga = round(float(np.mean(ga_all)), 2) if ga_all else league_a_g
+    season_xgf = round(float(np.mean(xgf_all)), 2) if xgf_all else 1.5
+    season_xga = round(float(np.mean(xga_all)), 2) if xga_all else 1.2
 
+    # 2. RECENT FORM STATS WITH VENUE-SPECIFIC OPPONENT STRENGTH
     home_m = _match_hist_team_rows(hist_df, 'HomeTeam', team_name)
     away_m = _match_hist_team_rows(hist_df, 'AwayTeam', team_name)
     combined_matches = pd.concat([home_m, away_m]).sort_values('Date', ascending=False).head(n_matches)
     
     if combined_matches.empty: 
-        default_res["season_gf"] = season_gf
-        default_res["season_ga"] = season_ga
+        default_res["season_xgf"] = season_xgf
+        default_res["season_xga"] = season_xga
         return default_res
 
     gf_list, ga_list, xgf_list, xga_list, opp_def_list, opp_att_list = [], [], [], [], [], []
@@ -353,10 +336,8 @@ def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matche
         gf_list.append(gf)
         ga_list.append(ga)
 
-        hs = row['HS'] if not pd.isna(row.get('HS')) else 10.0
-        as_ = row['AS'] if not pd.isna(row.get('AS')) else 10.0
-        hst = row['HST'] if not pd.isna(row.get('HST')) else 3.5
-        ast = row['AST'] if not pd.isna(row.get('AST')) else 3.5
+        hs, hst = row.get('HS', 10.0), row.get('HST', 3.5)
+        as_, ast = row.get('AS', 10.0), row.get('AST', 3.5)
 
         xg_home = 0.32 * hst + 0.03 * max(0, hs - hst)
         xg_away = 0.32 * ast + 0.03 * max(0, as_ - ast)
@@ -364,16 +345,15 @@ def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matche
         xgf_list.append(xg_home if is_home else xg_away)
         xga_list.append(xg_away if is_home else xg_home)
 
-        opp_home_rows = _match_hist_team_rows(hist_df, 'HomeTeam', opp_name).head(38)
-        opp_away_rows = _match_hist_team_rows(hist_df, 'AwayTeam', opp_name).head(38)
-        
-        opp_gf_h = opp_home_rows['FTHG'].mean() if not opp_home_rows.empty else league_h_g
-        opp_ga_h = opp_home_rows['FTAG'].mean() if not opp_home_rows.empty else league_a_g
-        opp_gf_a = opp_away_rows['FTAG'].mean() if not opp_away_rows.empty else league_a_g
-        opp_ga_a = opp_away_rows['FTHG'].mean() if not opp_away_rows.empty else league_h_g
-
-        opp_att = ((opp_gf_h + opp_gf_a) / 2.0) / ((league_h_g + league_a_g) / 2.0)
-        opp_def = ((opp_ga_h + opp_ga_a) / 2.0) / ((league_h_g + league_a_g) / 2.0)
+        # Match venue-specific opponent performance
+        if is_home:
+            opp_rows = _match_hist_team_rows(hist_df, 'AwayTeam', opp_name).head(38)
+            opp_att = (opp_rows['FTAG'].mean() / league_a_g) if not opp_rows.empty else 1.0
+            opp_def = (opp_rows['FTHG'].mean() / league_h_g) if not opp_rows.empty else 1.0
+        else:
+            opp_rows = _match_hist_team_rows(hist_df, 'HomeTeam', opp_name).head(38)
+            opp_att = (opp_rows['FTHG'].mean() / league_h_g) if not opp_rows.empty else 1.0
+            opp_def = (opp_rows['FTAG'].mean() / league_a_g) if not opp_rows.empty else 1.0
 
         opp_att_list.append(opp_att)
         opp_def_list.append(opp_def)
@@ -389,8 +369,8 @@ def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matche
         "xga": round(float(np.average(xga_list, weights=weights)), 2),
         "opp_def": round(float(np.average(opp_def_list, weights=weights)), 2),
         "opp_att": round(float(np.average(opp_att_list, weights=weights)), 2),
-        "season_gf": season_gf,
-        "season_ga": season_ga
+        "season_xgf": season_xgf,
+        "season_xga": season_xga
     }
 
 # ====================================================================================
@@ -864,7 +844,6 @@ def fetch_api_football_odds(home_team: str, away_team: str, league_name: str = "
     except Exception as e:
         return None, f"/odds request failed: {type(e).__name__}"
 
-
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_market_odds(home_team: str, away_team: str, league_name: str = "Premier League") -> dict:
     sport_key = ODDS_API_SPORT_KEYS.get(league_name, "soccer_epl")
@@ -1050,16 +1029,13 @@ class TeamModelInputs:
 
     @property
     def lambda_1x2(self) -> float:
-        # Full multiplier for 1X2 devigging (picks up accurate match winner probabilities)
         return round(max(self.base_lambda * self.combined_multiplier, 0.05), 3)
 
     @property
     def lambda_totals(self) -> float:
-        # Dampens the combined multiplier strictly for over/under to prevent artificial goal inflation
         gamma = 0.50
         dampened_mult = 1.0 + gamma * (self.combined_multiplier - 1.0)
         return round(max(self.base_lambda * dampened_mult, 0.05), 3)
-
 
 def dixon_coles_tau(x: int, y: int, lam_home: float, lam_away: float, rho: float = -0.06) -> float:
     if x == 0 and y == 0: return 1 - lam_home * lam_away * rho
@@ -1217,10 +1193,10 @@ with st.sidebar.expander("1. xG Regression & Opponent Strength", expanded=False)
     a_regressed_xgf = (a_true_xgf * 0.70) + (a_gf * 0.30)
     a_regressed_xga = (a_true_xga * 0.70) + (a_ga * 0.30)
 
-    h_att_reg_mult = h_regressed_xgf / auto_home_sos["season_gf"] if auto_home_sos["season_gf"] > 0 else 1.0
-    h_def_reg_mult = h_regressed_xga / auto_home_sos["season_ga"] if auto_home_sos["season_ga"] > 0 else 1.0
-    a_att_reg_mult = a_regressed_xgf / auto_away_sos["season_gf"] if auto_away_sos["season_gf"] > 0 else 1.0
-    a_def_reg_mult = a_regressed_xga / auto_away_sos["season_ga"] if auto_away_sos["season_ga"] > 0 else 1.0
+    h_att_reg_mult = h_regressed_xgf / auto_home_sos["season_xgf"] if auto_home_sos["season_xgf"] > 0 else 1.0
+    h_def_reg_mult = h_regressed_xga / auto_home_sos["season_xga"] if auto_home_sos["season_xga"] > 0 else 1.0
+    a_att_reg_mult = a_regressed_xgf / auto_away_sos["season_xgf"] if auto_away_sos["season_xgf"] > 0 else 1.0
+    a_def_reg_mult = a_regressed_xga / auto_away_sos["season_xga"] if auto_away_sos["season_xga"] > 0 else 1.0
 
     h_att_reg_mult = float(np.clip(h_att_reg_mult, 0.7, 1.3))
     h_def_reg_mult = float(np.clip(h_def_reg_mult, 0.7, 1.3))
