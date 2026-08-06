@@ -101,6 +101,25 @@ h2, h3 {
 # ====================================================================================
 # 1. SECURE KEY LOADING & CONFIGURATION
 # ====================================================================================
+def fmt_num(x, decimals: int = 2) -> str:
+    """
+    Display formatting used everywhere a number reaches the UI: whole
+    numbers show with zero decimal places (no trailing ".00"), everything
+    else is capped at `decimals` places (default 2). Internal computation
+    keeps full precision (e.g. round(x, 3) for actual math) — this only
+    controls what the user sees.
+    """
+    try:
+        val = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    if not np.isfinite(val):
+        return str(x)
+    if abs(val - round(val)) < 1e-9:
+        return str(int(round(val)))
+    return f"{round(val, decimals):.{decimals}f}"
+
+
 def get_secret(name: str) -> Optional[str]:
     try:
         if name in st.secrets:
@@ -1095,8 +1114,8 @@ with tab_mod:
         a_att_reg_mult = float(np.clip(a_regressed_xgf / auto_away_sos["season_xgf"] if auto_away_sos["season_xgf"] > 0 else 1.0, 0.7, 1.3))
         a_def_reg_mult = float(np.clip(a_regressed_xga / auto_away_sos["season_xga"] if auto_away_sos["season_xga"] > 0 else 1.0, 0.7, 1.3))
 
-        st.caption(f"**{home_team}:** Attack **{h_att_reg_mult:.2f}x** | Defense **{h_def_reg_mult:.2f}x**")
-        st.caption(f"**{away_team}:** Attack **{a_att_reg_mult:.2f}x** | Defense **{a_def_reg_mult:.2f}x**")
+        st.caption(f"**{home_team}:** Attack **{fmt_num(h_att_reg_mult)}x** | Defense **{fmt_num(h_def_reg_mult)}x**")
+        st.caption(f"**{away_team}:** Attack **{fmt_num(a_att_reg_mult)}x** | Defense **{fmt_num(a_def_reg_mult)}x**")
 
     with st.expander("2. Tactical Pressing (PPDA & Tilt)", expanded=False):
         c_p1, c_p2 = st.columns(2)
@@ -1106,12 +1125,12 @@ with tab_mod:
 
         h_press_mult = float(np.clip((1.0 + 0.05 * ((a_ppda / h_ppda if h_ppda > 0 else 1.0) - 1.0)) * (1.0 + tilt_diff/100 * 0.05), 0.85, 1.15))
         a_press_mult = float(np.clip((1.0 + 0.05 * ((h_ppda / a_ppda if a_ppda > 0 else 1.0) - 1.0)) * (1.0 - tilt_diff/100 * 0.05), 0.85, 1.15))
-        st.caption(f"Multiplier: Home **{h_press_mult:.2f}x** | Away **{a_press_mult:.2f}x**")
+        st.caption(f"Multiplier: Home **{fmt_num(h_press_mult)}x** | Away **{fmt_num(a_press_mult)}x**")
 
     with st.expander("3. Travel Distance & Fatigue", expanded=False):
         away_travel_km = st.number_input("Away Travel Distance (km)", value=0.0, step=100.0)
         away_travel_mult = max(0.90, 1.0 - (away_travel_km / 25000.0))
-        st.caption(f"Away Travel Penalty: **{away_travel_mult:.2f}x**")
+        st.caption(f"Away Travel Penalty: **{fmt_num(away_travel_mult)}x**")
 
     with st.expander("4. Cards & Referee Strictness", expanded=False):
         league_defaults = LEAGUE_DISCIPLINE_STATS.get(league, {"avg_fouls": 22.0, "avg_cards": 4.5})
@@ -1124,7 +1143,7 @@ with tab_mod:
 
         # MATH FIX 1: Clamp adjusted_rho to prevent math breakdown / negative tau values
         adjusted_rho = float(np.clip(adjusted_rho, -0.15, 0.05))
-        st.caption(f"Expected Match Cards: **{expected_cards:.1f}** | Adjusted Dixon-Coles ρ: **{adjusted_rho:.3f}**")
+        st.caption(f"Expected Match Cards: **{fmt_num(expected_cards)}** | Adjusted Dixon-Coles ρ: **{fmt_num(adjusted_rho)}**")
 
 with tab_lineup:
     rating_window = st.slider("Player Form Window (games)", 3, 5, 5)
@@ -1162,8 +1181,8 @@ with tab_match:
     if rating_mode == "Automated (Data-Driven)":
         st.success("🟢 Ratings auto-synced from data source")
         col1, col2 = st.columns(2)
-        with col1: st.metric(f"{home_team} α (Att)", home_tier_info["attack"]); st.metric(f"{home_team} β (Def)", home_tier_info["defense"])
-        with col2: st.metric(f"{away_team} α (Att)", away_tier_info["attack"]); st.metric(f"{away_team} β (Def)", away_tier_info["defense"])
+        with col1: st.metric(f"{home_team} α (Att)", fmt_num(home_tier_info["attack"])); st.metric(f"{home_team} β (Def)", fmt_num(home_tier_info["defense"]))
+        with col2: st.metric(f"{away_team} α (Att)", fmt_num(away_tier_info["attack"])); st.metric(f"{away_team} β (Def)", fmt_num(away_tier_info["defense"]))
         ratings_overridden = False
     else:
         st.warning("✏️ Custom override active")
@@ -1213,7 +1232,7 @@ devig_ou = devig_two_way(market_odds.get("over_2_5"), market_odds.get("under_2_5
 devig_btts = devig_two_way(market_odds.get("btts_yes"), market_odds.get("btts_no"))
 
 def build_trade_row(market_label, model_prob, model_odd, book_odd, fair_mkt_prob):
-    if not book_odd or book_odd <= 1.0: return {"Market": market_label, "Model Odds": model_odd, "Consensus Odds": "N/A", "Edge (pp)": 0, "Kelly Stake %": "0.0%", "Signal": "N/A"}
+    if not book_odd or book_odd <= 1.0: return {"Market": market_label, "Model Odds": fmt_num(model_odd), "Consensus Odds": "N/A", "Edge (pp)": "0", "Kelly Stake %": "0%", "Signal": "N/A"}
 
     devigged = True
     if fair_mkt_prob is None:
@@ -1233,7 +1252,7 @@ def build_trade_row(market_label, model_prob, model_odd, book_odd, fair_mkt_prob
         elif edge_pp <= -2.0: signal = "🔴 OVERPRICED"
         else: signal = "⚪ FAIR"
 
-    return {"Market": market_label, "Model Prob %": round(model_prob * 100, 1), "Model Odds": model_odd, "Consensus Odds": book_odd, "Fair Market Prob %": round(fair_mkt_prob * 100, 1), "Edge (pp)": edge_pp, "Kelly Stake %": f"{stake_pct}%", "Signal": signal}
+    return {"Market": market_label, "Model Prob %": fmt_num(model_prob * 100), "Model Odds": fmt_num(model_odd), "Consensus Odds": fmt_num(book_odd), "Fair Market Prob %": fmt_num(fair_mkt_prob * 100), "Edge (pp)": fmt_num(edge_pp), "Kelly Stake %": f"{fmt_num(stake_pct)}%", "Signal": signal}
 
 fair_mkt_h, fair_mkt_d, fair_mkt_a = devig_1x2 if devig_1x2 else (None, None, None)
 fair_ou_over, fair_ou_under = devig_ou if devig_ou else (None, None)
@@ -1253,12 +1272,14 @@ trade_rows = [
 # scroll to and scan row-by-row every time. ---
 play_rows = [r for r in trade_rows if r["Signal"] == "🟢 VALUE (PLAY)"]
 if play_rows:
-    best = max(play_rows, key=lambda r: r["Edge (pp)"])
+    best = max(play_rows, key=lambda r: float(r["Edge (pp)"]))
+    edge_val = float(best["Edge (pp)"])
+    edge_str = f"+{best['Edge (pp)']}" if edge_val > 0 else best["Edge (pp)"]
     st.markdown(f"""
     <div class="signal-card play">
         <div class="label">🟢 Top Signal</div>
         <div class="headline">{best['Market']} — Model {best['Model Odds']} vs Consensus {best['Consensus Odds']}
-        &nbsp;·&nbsp; Edge {best['Edge (pp)']:+.2f}pp &nbsp;·&nbsp; Kelly Stake {best['Kelly Stake %']}</div>
+        &nbsp;·&nbsp; Edge {edge_str}pp &nbsp;·&nbsp; Kelly Stake {best['Kelly Stake %']}</div>
     </div>
     """, unsafe_allow_html=True)
 else:
@@ -1283,20 +1304,20 @@ if "historical CSV" in lambda_source:
 c1, c2, c3, c4 = st.columns(4)
 with c1:
     with st.container(border=True):
-        st.metric("λ Home (1X2 | Totals)", f"{lam_home_1x2} | {lam_home_tot}")
-        st.caption(f"Combined Multiplier: **{home_model.combined_multiplier:.2f}x**")
+        st.metric("λ Home (1X2 | Totals)", f"{fmt_num(lam_home_1x2)} | {fmt_num(lam_home_tot)}")
+        st.caption(f"Combined Multiplier: **{fmt_num(home_model.combined_multiplier)}x**")
 with c2:
     with st.container(border=True):
-        st.metric("λ Away (1X2 | Totals)", f"{lam_away_1x2} | {lam_away_tot}")
-        st.caption(f"Combined Multiplier: **{away_model.combined_multiplier:.2f}x**")
+        st.metric("λ Away (1X2 | Totals)", f"{fmt_num(lam_away_1x2)} | {fmt_num(lam_away_tot)}")
+        st.caption(f"Combined Multiplier: **{fmt_num(away_model.combined_multiplier)}x**")
 with c3:
     with st.container(border=True):
-        st.metric(f"BTTS Correlation (γ)", f"{btts_correlation_tot:.3f}")
+        st.metric(f"BTTS Correlation (γ)", fmt_num(btts_correlation_tot))
         st.caption("Auto-scales mutual scoring probability for open matches.")
 with c4:
     with st.container(border=True):
-        st.metric("🌡️ Temp", f"{weather['temperature_c']}°C")
-        st.metric("💨 Wind", f"{weather['wind_speed_kmh']} km/h")
+        st.metric("🌡️ Temp", f"{fmt_num(weather['temperature_c'])}°C")
+        st.metric("💨 Wind", f"{fmt_num(weather['wind_speed_kmh'])} km/h")
 
 with st.expander("📊 Rating Calculation Breakdown"):
     primary_league_name = league
@@ -1304,10 +1325,10 @@ with st.expander("📊 Rating Calculation Breakdown"):
     summary_rows = []
     for team_name, info in ((home_team, home_tier_info), (away_team, away_tier_info)):
         if info["tier"] == "second-tier (promotion-adjusted)":
-            summary_rows.append({"Team": team_name, "Context": f"{secondary_league_name} Baseline", "Attack Rating (α)": info["raw_attack"], "Defense Rating (β)": info["raw_defense"]})
-            summary_rows.append({"Team": team_name, "Context": f"{primary_league_name} Adjusted", "Attack Rating (α)": info["attack"], "Defense Rating (β)": info["defense"]})
+            summary_rows.append({"Team": team_name, "Context": f"{secondary_league_name} Baseline", "Attack Rating (α)": fmt_num(info["raw_attack"]), "Defense Rating (β)": fmt_num(info["raw_defense"])})
+            summary_rows.append({"Team": team_name, "Context": f"{primary_league_name} Adjusted", "Attack Rating (α)": fmt_num(info["attack"]), "Defense Rating (β)": fmt_num(info["defense"])})
         else:
-            summary_rows.append({"Team": team_name, "Context": f"{primary_league_name} Baseline", "Attack Rating (α)": info["attack"], "Defense Rating (β)": info["defense"]})
+            summary_rows.append({"Team": team_name, "Context": f"{primary_league_name} Baseline", "Attack Rating (α)": fmt_num(info["attack"]), "Defense Rating (β)": fmt_num(info["defense"])})
     st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
 
 st.divider()
@@ -1319,12 +1340,20 @@ st.caption(f"Squad data source — {home_team}: **{home_squad_source}** · {away
 
 pc1, pc2 = st.columns(2)
 display_cols = ["player", "position", "avg_rating", "games_rated", "xG90", "xA90", "status", "absence_penalty_%"]
+numeric_display_cols = ["avg_rating", "xG90", "xA90", "absence_penalty_%"]
+
+def _format_squad_for_display(squad_df: pd.DataFrame) -> pd.DataFrame:
+    sorted_df = squad_df[display_cols].sort_values("avg_rating", ascending=False, na_position="last").copy()
+    for col in numeric_display_cols:
+        sorted_df[col] = sorted_df[col].apply(lambda v: fmt_num(v) if pd.notna(v) else v)
+    return sorted_df
+
 with pc1:
     st.markdown(f"**{home_team} Lineup & Stats**")
-    st.dataframe(home_squad[display_cols].sort_values("avg_rating", ascending=False, na_position="last"), hide_index=True)
+    st.dataframe(_format_squad_for_display(home_squad), hide_index=True)
 with pc2:
     st.markdown(f"**{away_team} Lineup & Stats**")
-    st.dataframe(away_squad[display_cols].sort_values("avg_rating", ascending=False, na_position="last"), hide_index=True)
+    st.dataframe(_format_squad_for_display(away_squad), hide_index=True)
 
 st.divider()
 
@@ -1351,6 +1380,7 @@ st.divider()
 
 st.subheader("🔥 Scoreline Probability Matrix Heatmap (1X2 Base)")
 heat_labels = list(range(matrix_1x2.shape[0]))
-fig = go.Figure(data=go.Heatmap(z=matrix_1x2 * 100, x=[f"{away_team} {g}" for g in heat_labels], y=[f"{home_team} {g}" for g in heat_labels], colorscale="YlOrRd", text=np.round(matrix_1x2 * 100, 1), texttemplate="%{text}%", textfont={"size": 11}, hoverongaps=False))
-fig.update_layout(title=f"Scoreline Distribution (%) — Dixon-Coles ρ: {adjusted_rho:.3f} | BTTS γ: {btts_correlation_1x2:.3f}", xaxis_title=f"Away Goals ({away_team})", yaxis_title=f"Home Goals ({home_team})", height=500, margin=dict(l=40, r=40, t=50, b=40))
+heat_text = np.array([[fmt_num(v) for v in row] for row in (matrix_1x2 * 100)])
+fig = go.Figure(data=go.Heatmap(z=matrix_1x2 * 100, x=[f"{away_team} {g}" for g in heat_labels], y=[f"{home_team} {g}" for g in heat_labels], colorscale="YlOrRd", text=heat_text, texttemplate="%{text}%", textfont={"size": 11}, hoverongaps=False))
+fig.update_layout(title=f"Scoreline Distribution (%) — Dixon-Coles ρ: {fmt_num(adjusted_rho)} | BTTS γ: {fmt_num(btts_correlation_1x2)}", xaxis_title=f"Away Goals ({away_team})", yaxis_title=f"Home Goals ({home_team})", height=500, margin=dict(l=40, r=40, t=50, b=40))
 st.plotly_chart(fig)
