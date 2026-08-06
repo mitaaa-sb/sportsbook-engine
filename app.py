@@ -22,104 +22,8 @@ st.set_page_config(
 )
 
 # ====================================================================================
-# DESIGN SYSTEM
-# ====================================================================================
-# Signature: a single teal accent (#14B8A6) for identity/structure, amber (#F5A524)
-# reserved exclusively for the "play this" signal so it never gets diluted by
-# routine UI chrome, and IBM Plex Mono for every number in the app (odds, lambdas,
-# percentages) so the numeric grain of a quant terminal reads differently from the
-# surrounding sans-serif labels — the read is "this is instrumentation," not just
-# another dashboard template.
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap');
-
-:root {
-    --accent-teal: #14B8A6;
-    --accent-amber: #F5A524;
-    --accent-red: #EF4444;
-    --panel-bg: rgba(20, 184, 166, 0.06);
-    --panel-border: rgba(20, 184, 166, 0.25);
-}
-
-/* Numeric grain: every st.metric value, and any span/div tagged .mono, renders
-   in IBM Plex Mono so the instrument-panel numbers read distinctly from prose. */
-[data-testid="stMetricValue"], .mono {
-    font-family: 'IBM Plex Mono', monospace !important;
-    letter-spacing: -0.01em;
-}
-[data-testid="stMetricLabel"] {
-    font-size: 0.78rem;
-    opacity: 0.75;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-}
-
-/* Section headers get a teal rule instead of default weight-only emphasis */
-h2, h3 {
-    border-bottom: 1px solid var(--panel-border);
-    padding-bottom: 0.35rem;
-}
-
-/* Sidebar tabs: give the active tab a teal underline instead of the default
-   red, so the whole instrument shares one accent language top to bottom. */
-.stTabs [aria-selected="true"] {
-    color: var(--accent-teal) !important;
-    border-bottom-color: var(--accent-teal) !important;
-}
-
-/* Top-signal callout card */
-.signal-card {
-    border-radius: 10px;
-    padding: 1rem 1.25rem;
-    margin-bottom: 1rem;
-    font-family: 'IBM Plex Mono', monospace;
-}
-.signal-card.play {
-    background: rgba(245, 165, 36, 0.10);
-    border: 1px solid rgba(245, 165, 36, 0.45);
-}
-.signal-card.none {
-    background: rgba(148, 163, 184, 0.08);
-    border: 1px solid rgba(148, 163, 184, 0.25);
-}
-.signal-card .label {
-    font-family: -apple-system, sans-serif;
-    font-size: 0.72rem;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    opacity: 0.7;
-    margin-bottom: 0.25rem;
-}
-.signal-card .headline {
-    font-size: 1.05rem;
-    font-weight: 600;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# ====================================================================================
 # 1. SECURE KEY LOADING & CONFIGURATION
 # ====================================================================================
-def fmt_num(x, decimals: int = 2) -> str:
-    """
-    Display formatting used everywhere a number reaches the UI: whole
-    numbers show with zero decimal places (no trailing ".00"), everything
-    else is capped at `decimals` places (default 2). Internal computation
-    keeps full precision (e.g. round(x, 3) for actual math) — this only
-    controls what the user sees.
-    """
-    try:
-        val = float(x)
-    except (TypeError, ValueError):
-        return str(x)
-    if not np.isfinite(val):
-        return str(x)
-    if abs(val - round(val)) < 1e-9:
-        return str(int(round(val)))
-    return f"{round(val, decimals):.{decimals}f}"
-
-
 def get_secret(name: str) -> Optional[str]:
     try:
         if name in st.secrets:
@@ -367,7 +271,7 @@ def calculate_historical_lambdas(home_team: str, away_team: str, hist_df: pd.Dat
 
     return (round(float(lam_home), 3), round(float(lam_away), 3), home_info, away_info, round(float(league_home_avg_g), 3), round(float(league_away_avg_g), 3))
 
-def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matches: int = 5) -> dict:
+def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matches: int = 10) -> dict:
     default_res = {"gf": 1.5, "xgf": 1.5, "ga": 1.2, "xga": 1.2, "opp_def": 1.00, "opp_att": 1.00, "season_xgf": 1.5, "season_xga": 1.2}
     if hist_df.empty: return default_res
 
@@ -381,16 +285,24 @@ def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matche
     for _, row in home_all.iterrows():
         hs, hst = row.get('HS', 10.0), row.get('HST', 3.5)
         as_, ast = row.get('AS', 10.0), row.get('AST', 3.5)
+        hs = 10.0 if pd.isna(hs) else hs
+        hst = 3.5 if pd.isna(hst) else hst
+        as_ = 10.0 if pd.isna(as_) else as_
+        ast = 3.5 if pd.isna(ast) else ast
         xgf_all.append(0.32 * hst + 0.03 * max(0, hs - hst))
         xga_all.append(0.32 * ast + 0.03 * max(0, as_ - ast))
     for _, row in away_all.iterrows():
         hs, hst = row.get('HS', 10.0), row.get('HST', 3.5)
         as_, ast = row.get('AS', 10.0), row.get('AST', 3.5)
+        hs = 10.0 if pd.isna(hs) else hs
+        hst = 3.5 if pd.isna(hst) else hst
+        as_ = 10.0 if pd.isna(as_) else as_
+        ast = 3.5 if pd.isna(ast) else ast
         xgf_all.append(0.32 * ast + 0.03 * max(0, as_ - ast))
         xga_all.append(0.32 * hst + 0.03 * max(0, hs - hst))
         
-    season_xgf = round(float(np.mean(xgf_all)), 2) if xgf_all else 1.5
-    season_xga = round(float(np.mean(xga_all)), 2) if xga_all else 1.2
+    season_xgf = float(np.mean(xgf_all)) if xgf_all else 1.5
+    season_xga = float(np.mean(xga_all)) if xga_all else 1.2
 
     home_m = _match_hist_team_rows(hist_df, 'HomeTeam', team_name)
     away_m = _match_hist_team_rows(hist_df, 'AwayTeam', team_name)
@@ -412,6 +324,11 @@ def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matche
 
         hs, hst = row.get('HS', 10.0), row.get('HST', 3.5)
         as_, ast = row.get('AS', 10.0), row.get('AST', 3.5)
+        hs = 10.0 if pd.isna(hs) else hs
+        hst = 3.5 if pd.isna(hst) else hst
+        as_ = 10.0 if pd.isna(as_) else as_
+        ast = 3.5 if pd.isna(ast) else ast
+        
         xg_home = 0.32 * hst + 0.03 * max(0, hs - hst)
         xg_away = 0.32 * ast + 0.03 * max(0, as_ - ast)
 
@@ -430,8 +347,8 @@ def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matche
         opp_att_list.append(opp_att)
         opp_def_list.append(opp_def)
 
-    weights = np.array([0.30, 0.25, 0.20, 0.15, 0.10])
-    if len(gf_list) < 5: weights = weights[:len(gf_list)] / weights[:len(gf_list)].sum()
+    weights = np.array([0.22, 0.18, 0.15, 0.12, 0.10, 0.08, 0.06, 0.05, 0.03, 0.01])
+    if len(gf_list) < 10: weights = weights[:len(gf_list)] / weights[:len(gf_list)].sum()
 
     return {
         "gf": round(float(np.average(gf_list, weights=weights)), 2),
@@ -745,9 +662,9 @@ def fetch_team_form(team_name: str, league_name: str = "Premier League") -> pd.D
             team_id = next((row["team"]["id"] for row in total_table if row["team"]["name"] == team_name_match), None) if team_name_match else None
 
             if team_id:
-                r_m = requests.get(f"{FOOTBALL_DATA_BASE}/teams/{team_id}/matches", headers=headers, params={"status": "FINISHED", "limit": 5}, timeout=8)
+                r_m = requests.get(f"{FOOTBALL_DATA_BASE}/teams/{team_id}/matches", headers=headers, params={"status": "FINISHED", "limit": 10}, timeout=8)
                 r_m.raise_for_status()
-                matches = r_m.json().get("matches", [])[-5:]
+                matches = r_m.json().get("matches", [])[-10:]
                 rows = []
                 for idx, m in enumerate(matches):
                     is_home = is_team_match(m["homeTeam"]["name"], team_name)
@@ -909,9 +826,9 @@ def player_impact_score(squad: pd.DataFrame, active_mask: dict) -> Tuple[float, 
     return round(0.60 + 0.40 * (active_piv / max(total_piv, 1e-6)), 3), squad
 
 def team_form_rating_0_100(form_df: pd.DataFrame) -> float:
-    weights = np.array([0.10, 0.15, 0.20, 0.25, 0.30])
+    weights = np.array([0.22, 0.18, 0.15, 0.12, 0.10, 0.08, 0.06, 0.05, 0.03, 0.01])
     df = form_df.sort_values("matches_ago", ascending=False).reset_index(drop=True)
-    if len(df) < 5: weights = weights[-len(df):] / weights[-len(df):].sum()
+    if len(df) < 10: weights = weights[-len(df):] / weights[-len(df):].sum()
     return round(min(max(50 + float(((df["xG_for"] - df["xG_against"]) * weights).sum()) * 25, 0), 100), 1)
 
 def weather_modifier(weather: dict) -> float:
@@ -963,28 +880,23 @@ def dixon_coles_tau(x: int, y: int, lam_home: float, lam_away: float, rho: float
     elif x == 1 and y == 1: return 1 - rho
     return 1.0
 
-# ------------------------------------------------------------------------------------
-# MATH FIX: BTTS COPULA / BIVARIATE CORRELATION
-# ------------------------------------------------------------------------------------
-def scoreline_matrix(lam_home: float, lam_away: float, max_goals: int = 9, rho: float = -0.06, btts_mult: float = 1.0) -> np.ndarray:
-    """
-    Constructs the probability matrix. Integrates the Dixon-Coles rho (low-score dependency)
-    AND a custom BTTS multiplier (btts_mult) which functions as a crude copula
-    to inflate the probability of mutual scoring states (i > 0 and j > 0).
-    """
+def scoreline_matrix(lam_home: float, lam_away: float, max_goals: int = 9, rho: float = -0.06, btts_mult: float = 1.0, overdispersion=False) -> np.ndarray:
     matrix = np.zeros((max_goals + 1, max_goals + 1))
     for i in range(max_goals + 1):
         for j in range(max_goals + 1):
             p = poisson.pmf(i, lam_home) * poisson.pmf(j, lam_away) * dixon_coles_tau(i, j, lam_home, lam_away, rho)
             
-            # MATH FIX 2: Apply the BTTS Copula inflation to non-zero scorelines, excluding 1-1
-            # (Dixon-Coles already strictly handles the 1-1 cell).
             if i > 0 and j > 0 and not (i == 1 and j == 1):
                 p *= btts_mult
                 
+            if overdispersion:
+                if i + j >= 3:
+                    p *= 1.06
+                elif i + j <= 2:
+                    p *= 0.96
+                    
             matrix[i, j] = max(p, 0)
             
-    # Normalize back to 1.0 probability mass
     matrix /= matrix.sum()
     return matrix
 
@@ -998,21 +910,49 @@ def apply_margin(probs: dict, target_margin_pct: float) -> dict:
     margin_factor = 1 + (target_margin_pct / 100)
     return {k: round(fair_odds(v) / margin_factor, 2) for k, v in probs.items()}
 
+# FIX 1: Power Method Devigging implemented for Streamlit UI
+def power_method_devig(odds_list):
+    """
+    BUGFIX: previously returned [0.0]*len(odds_list) when any input odd was
+    missing/invalid (None, NaN, or <= 1.0) -- a same-length list, not a
+    failure signal. Callers checked `len(res) == len(odds_list)`, which was
+    ALWAYS true either way, so a single missing price (e.g. no draw odds
+    returned) silently produced (0.0, 0.0, 0.0) instead of None. Since a
+    non-empty tuple is truthy in Python, downstream code treated that as a
+    real devig result and computed a fake edge equal to nearly the model's
+    entire own probability (verified: ~27.5pp out of nothing). Returns None
+    now so callers can detect the failure the way they already intended to.
+    """
+    inv_odds = [1.0 / o for o in odds_list if not pd.isna(o) and o > 1.0]
+    if len(inv_odds) != len(odds_list): return None
+    
+    overround = sum(inv_odds)
+    if overround <= 1.0: return inv_odds
+    
+    low, high = 1.0, 50.0
+    for _ in range(30):
+        mid = (low + high) / 2.0
+        if sum(p ** mid for p in inv_odds) > 1.0:
+            low = mid
+        else:
+            high = mid
+            
+    k = (low + high) / 2.0
+    return [p ** k for p in inv_odds]
+
 def devig_proportional(home_o: float, draw_o: float, away_o: float) -> Optional[Tuple[float, float, float]]:
-    if not all([home_o, draw_o, away_o]) or any(o <= 1.0 for o in [home_o, draw_o, away_o]): return None
-    raw_h, raw_d, raw_a = 1 / home_o, 1 / draw_o, 1 / away_o
-    overround = raw_h + raw_d + raw_a
-    return round(raw_h / overround, 4), round(raw_d / overround, 4), round(raw_a / overround, 4)
+    res = power_method_devig([home_o, draw_o, away_o])
+    if res is None: return None
+    return round(res[0], 4), round(res[1], 4), round(res[2], 4)
 
 def devig_two_way(odd_a: float, odd_b: float) -> Optional[Tuple[float, float]]:
-    if not odd_a or not odd_b or odd_a <= 1.0 or odd_b <= 1.0: return None
-    raw_a, raw_b = 1 / odd_a, 1 / odd_b
-    overround = raw_a + raw_b
-    return round(raw_a / overround, 4), round(raw_b / overround, 4)
+    res = power_method_devig([odd_a, odd_b])
+    if res is None: return None
+    return round(res[0], 4), round(res[1], 4)
 
-def kelly_stake(model_prob: float, book_odds: float, fraction: float = 0.125, max_cap: float = 0.025) -> float:
-    if not book_odds or book_odds <= 1.0 or model_prob <= 0: return 0.0
-    f = ((book_odds - 1.0) * model_prob - (1.0 - model_prob)) / (book_odds - 1.0)
+def kelly_stake(prob, odds, fraction=0.125, max_cap=0.025):
+    if odds <= 1.0 or prob <= 0: return 0.0
+    f = ((odds - 1.0) * prob - (1.0 - prob)) / (odds - 1.0)
     return round(min(max(0.0, f * fraction), max_cap) * 100, 2)
 
 def derive_markets(matrix: np.ndarray) -> dict:
@@ -1038,31 +978,21 @@ st.sidebar.caption("Quant Modeling & Devigged Edge Detection")
 
 if DEMO_MODE: st.sidebar.warning("⚠️ **DEMO MODE**: Set API keys in `st.secrets`.")
 
-status_cols = st.sidebar.columns(4)
-for col, (label, ok) in zip(status_cols, [
-    ("API-Ftbl", bool(API_FOOTBALL_KEY)), ("Fbl-Data", bool(FOOTBALL_DATA_KEY)),
-    ("Odds API", bool(THE_ODDS_API_KEY)), ("Hist CSV", True),
-]):
-    col.markdown(f"<div style='text-align:center;font-size:0.68rem'>{'🟢' if ok else '🔴'}<br>{label}</div>", unsafe_allow_html=True)
+st.sidebar.subheader("API & Data Connections")
+st.sidebar.markdown(f"{'🟢' if API_FOOTBALL_KEY else '🔴'} API-Football")
+st.sidebar.markdown(f"{'🟢' if FOOTBALL_DATA_KEY else '🔴'} football-data.org")
+st.sidebar.markdown(f"{'🟢' if THE_ODDS_API_KEY else '🔴'} The Odds API")
+st.sidebar.markdown("🟢 Historical CSV Engine")
 
 if st.sidebar.button("🔄 Refresh Rosters & Live Stats", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
 
 st.sidebar.divider()
-
-# Four tabs replace what used to be one long, flat scroll of subheaders and
-# expanders. Widget code below is grouped by what a trader actually thinks in
-# terms of — Match / Modifiers / Risk / Lineups — not by the order features
-# were bolted on historically. `with tab_x:` blocks don't need to be
-# contiguous in the script, so the underlying computation order is untouched.
-tab_match, tab_mod, tab_risk, tab_lineup = st.sidebar.tabs(["🎯 Match", "🎚️ Modifiers", "💰 Risk", "👥 Lineups"])
-
-with tab_match:
-    league = st.selectbox("Select League", list(LEAGUES.keys()))
-    fixtures_df = fetch_fixtures(league)
-    fixtures_df["label"] = fixtures_df["home_team"] + " vs " + fixtures_df["away_team"]
-    match_label = st.selectbox("Select Match", fixtures_df["label"])
+league = st.sidebar.selectbox("Select League", list(LEAGUES.keys()))
+fixtures_df = fetch_fixtures(league)
+fixtures_df["label"] = fixtures_df["home_team"] + " vs " + fixtures_df["away_team"]
+match_label = st.sidebar.selectbox("Select Match", fixtures_df["label"])
 match_row = fixtures_df.loc[fixtures_df["label"] == match_label].iloc[0]
 
 home_team, away_team, kickoff = match_row["home_team"], match_row["away_team"], match_row["kickoff"]
@@ -1072,90 +1002,99 @@ hist_df = fetch_historical_league_data(hist_code)
 secondary_code = HIST_SECONDARY_LEAGUE_MAP.get(hist_code)
 secondary_hist_df = fetch_historical_league_data(secondary_code) if secondary_code else pd.DataFrame()
 
-with tab_risk:
-    st.caption("Margin, sizing, and the value filters that gate a signal from FAIR to PLAY.")
-    target_margin = st.slider("Target Model Margin (%)", 2.0, 8.0, 5.0, 0.5)
-    kelly_fraction = st.slider("Kelly Fractional Sizing", 0.05, 1.0, 0.125, 0.025, help="0.125 = Eighth Kelly (Recommended)")
-    max_stake_cap = st.slider("Max Stake Cap (% Bankroll)", 1.0, 10.0, 2.5, 0.5) / 100.0
-    st.markdown("**Value Safety Filters**")
-    max_odds_cap = st.number_input("Max Bookmaker Odds (Cap)", value=2.20, step=0.10)
-    min_model_conf = st.number_input("Min Model Confidence (Fair Odds)", value=1.70, step=0.10)
+st.sidebar.divider()
+st.sidebar.subheader("Trading Parameters & Variance Limits")
+target_margin = st.sidebar.slider("Target Model Margin (%)", 2.0, 8.0, 5.0, 0.5)
 
-with tab_mod:
-    st.caption("Rest Differential (Days Rest)")
-    c_r1, c_r2 = st.columns(2)
-    with c_r1: home_rest = st.number_input(f"{home_team}", min_value=1, max_value=14, value=7)
-    with c_r2: away_rest = st.number_input(f"{away_team}", min_value=1, max_value=14, value=7)
+kelly_fraction = st.sidebar.slider("Kelly Fractional Sizing", 0.05, 1.0, 0.125, 0.025, help="0.125 = Eighth Kelly (Recommended)")
+max_stake_cap = st.sidebar.slider("Max Stake Cap (% Bankroll)", 1.0, 10.0, 2.5, 0.5) / 100.0
 
-    auto_home_sos = fetch_team_recent_xg_and_sos(home_team, hist_df, n_matches=5)
-    auto_away_sos = fetch_team_recent_xg_and_sos(away_team, hist_df, n_matches=5)
+st.sidebar.markdown("**Value Safety Filters**")
+max_odds_cap = st.sidebar.number_input("Max Bookmaker Odds (Cap)", value=1.60, step=0.10)
+min_model_conf = st.sidebar.number_input("Min Model Confidence (Fair Odds)", value=1.60, step=0.10)
 
-    with st.expander("1. xG Regression & Opponent Strength", expanded=False):
-        st.markdown(f"**{home_team} (Recent Form)**")
-        c_h1, c_h2, c_h3 = st.columns(3)
-        with c_h1: h_gf = st.number_input(f"{home_team} GF", value=float(auto_home_sos["gf"]), step=0.1, key="h_gf_in"); h_xgf = st.number_input(f"{home_team} xGF", value=float(auto_home_sos["xgf"]), step=0.1, key="h_xgf_in")
-        with c_h2: h_ga = st.number_input(f"{home_team} GA", value=float(auto_home_sos["ga"]), step=0.1, key="h_ga_in"); h_xga = st.number_input(f"{home_team} xGA", value=float(auto_home_sos["xga"]), step=0.1, key="h_xga_in")
-        with c_h3: h_opp_def = st.number_input("Opp Avg Def (β)", value=float(auto_home_sos["opp_def"]), step=0.05, key="h_opp_d"); h_opp_att = st.number_input("Opp Avg Att (α)", value=float(auto_home_sos["opp_att"]), step=0.05, key="h_opp_a")
+st.sidebar.subheader("Rest Differential (Days Rest)")
+c_r1, c_r2 = st.sidebar.columns(2)
+with c_r1: home_rest = st.number_input(f"{home_team}", min_value=1, max_value=14, value=7)
+with c_r2: away_rest = st.number_input(f"{away_team}", min_value=1, max_value=14, value=7)
 
-        st.markdown(f"**{away_team} (Recent Form)**")
-        c_a1, c_a2, c_a3 = st.columns(3)
-        with c_a1: a_gf = st.number_input(f"{away_team} GF", value=float(auto_away_sos["gf"]), step=0.1, key="a_gf_in"); a_xgf = st.number_input(f"{away_team} xGF", value=float(auto_away_sos["xgf"]), step=0.1, key="a_xgf_in")
-        with c_a2: a_ga = st.number_input(f"{away_team} GA", value=float(auto_away_sos["ga"]), step=0.1, key="a_ga_in"); a_xga = st.number_input(f"{away_team} xGA", value=float(auto_away_sos["xga"]), step=0.1, key="a_xga_in")
-        with c_a3: a_opp_def = st.number_input("Opp Avg Def (β)", value=float(auto_away_sos["opp_def"]), step=0.05, key="a_opp_d"); a_opp_att = st.number_input("Opp Avg Att (α)", value=float(auto_away_sos["opp_att"]), step=0.05, key="a_opp_a")
+st.sidebar.divider()
+st.sidebar.subheader("🔬 Advanced Modifiers")
 
-        h_true_xgf, h_true_xga = h_xgf / h_opp_def if h_opp_def > 0 else h_xgf, h_xga / h_opp_att if h_opp_att > 0 else h_xga
-        a_true_xgf, a_true_xga = a_xgf / a_opp_def if a_opp_def > 0 else a_xgf, a_xga / a_opp_att if a_opp_att > 0 else a_xga
+auto_home_sos = fetch_team_recent_xg_and_sos(home_team, hist_df, n_matches=10)
+auto_away_sos = fetch_team_recent_xg_and_sos(away_team, hist_df, n_matches=10)
 
-        h_regressed_xgf, h_regressed_xga = (h_true_xgf * 0.70) + (h_gf * 0.30), (h_true_xga * 0.70) + (h_ga * 0.30)
-        a_regressed_xgf, a_regressed_xga = (a_true_xgf * 0.70) + (a_gf * 0.30), (a_true_xga * 0.70) + (a_ga * 0.30)
+with st.sidebar.expander("1. xG Regression & Opponent Strength", expanded=False):
+    st.markdown(f"**{home_team} (Recent Form)**")
+    c_h1, c_h2, c_h3 = st.columns(3)
+    with c_h1: h_gf = st.number_input(f"{home_team} GF", value=float(auto_home_sos["gf"]), step=0.1, key="h_gf_in"); h_xgf = st.number_input(f"{home_team} xGF", value=float(auto_home_sos["xgf"]), step=0.1, key="h_xgf_in")
+    with c_h2: h_ga = st.number_input(f"{home_team} GA", value=float(auto_home_sos["ga"]), step=0.1, key="h_ga_in"); h_xga = st.number_input(f"{home_team} xGA", value=float(auto_home_sos["xga"]), step=0.1, key="h_xga_in")
+    with c_h3: h_opp_def = st.number_input("Opp Avg Def (β)", value=float(auto_home_sos["opp_def"]), step=0.05, key="h_opp_d"); h_opp_att = st.number_input("Opp Avg Att (α)", value=float(auto_home_sos["opp_att"]), step=0.05, key="h_opp_a")
 
-        h_att_reg_mult = float(np.clip(h_regressed_xgf / auto_home_sos["season_xgf"] if auto_home_sos["season_xgf"] > 0 else 1.0, 0.7, 1.3))
-        h_def_reg_mult = float(np.clip(h_regressed_xga / auto_home_sos["season_xga"] if auto_home_sos["season_xga"] > 0 else 1.0, 0.7, 1.3))
-        a_att_reg_mult = float(np.clip(a_regressed_xgf / auto_away_sos["season_xgf"] if auto_away_sos["season_xgf"] > 0 else 1.0, 0.7, 1.3))
-        a_def_reg_mult = float(np.clip(a_regressed_xga / auto_away_sos["season_xga"] if auto_away_sos["season_xga"] > 0 else 1.0, 0.7, 1.3))
+    st.markdown(f"**{away_team} (Recent Form)**")
+    c_a1, c_a2, c_a3 = st.columns(3)
+    with c_a1: a_gf = st.number_input(f"{away_team} GF", value=float(auto_away_sos["gf"]), step=0.1, key="a_gf_in"); a_xgf = st.number_input(f"{away_team} xGF", value=float(auto_away_sos["xgf"]), step=0.1, key="a_xgf_in")
+    with c_a2: a_ga = st.number_input(f"{away_team} GA", value=float(auto_away_sos["ga"]), step=0.1, key="a_ga_in"); a_xga = st.number_input(f"{away_team} xGA", value=float(auto_away_sos["xga"]), step=0.1, key="a_xga_in")
+    with c_a3: a_opp_def = st.number_input("Opp Avg Def (β)", value=float(auto_away_sos["opp_def"]), step=0.05, key="a_opp_d"); a_opp_att = st.number_input("Opp Avg Att (α)", value=float(auto_away_sos["opp_att"]), step=0.05, key="a_opp_a")
 
-        st.caption(f"**{home_team}:** Attack **{fmt_num(h_att_reg_mult)}x** | Defense **{fmt_num(h_def_reg_mult)}x**")
-        st.caption(f"**{away_team}:** Attack **{fmt_num(a_att_reg_mult)}x** | Defense **{fmt_num(a_def_reg_mult)}x**")
+    h_true_xgf, h_true_xga = h_xgf / h_opp_def if h_opp_def > 0 else h_xgf, h_xga / h_opp_att if h_opp_att > 0 else h_xga
+    a_true_xgf, a_true_xga = a_xgf / a_opp_def if a_opp_def > 0 else a_xgf, a_xga / a_opp_att if a_opp_att > 0 else a_xga
 
-    with st.expander("2. Tactical Pressing (PPDA & Tilt)", expanded=False):
-        c_p1, c_p2 = st.columns(2)
-        with c_p1: h_ppda = st.number_input(f"{home_team} PPDA", value=12.0, step=0.5)
-        with c_p2: a_ppda = st.number_input(f"{away_team} PPDA", value=12.0, step=0.5)
-        tilt_diff = st.number_input("Field Tilt Diff (%)", value=0.0, step=1.0)
+    h_regressed_xgf, h_regressed_xga = (h_true_xgf * 0.70) + (h_gf * 0.30), (h_true_xga * 0.70) + (h_ga * 0.30)
+    a_regressed_xgf, a_regressed_xga = (a_true_xgf * 0.70) + (a_gf * 0.30), (a_true_xga * 0.70) + (a_ga * 0.30)
 
-        h_press_mult = float(np.clip((1.0 + 0.05 * ((a_ppda / h_ppda if h_ppda > 0 else 1.0) - 1.0)) * (1.0 + tilt_diff/100 * 0.05), 0.85, 1.15))
-        a_press_mult = float(np.clip((1.0 + 0.05 * ((h_ppda / a_ppda if a_ppda > 0 else 1.0) - 1.0)) * (1.0 - tilt_diff/100 * 0.05), 0.85, 1.15))
-        st.caption(f"Multiplier: Home **{fmt_num(h_press_mult)}x** | Away **{fmt_num(a_press_mult)}x**")
+    h_att_reg_mult = float(np.clip(h_regressed_xgf / auto_home_sos["season_xgf"] if auto_home_sos["season_xgf"] > 0 else 1.0, 0.85, 1.15))
+    h_def_reg_mult = float(np.clip(h_regressed_xga / auto_home_sos["season_xga"] if auto_home_sos["season_xga"] > 0 else 1.0, 0.85, 1.15))
+    a_att_reg_mult = float(np.clip(a_regressed_xgf / auto_away_sos["season_xgf"] if auto_away_sos["season_xgf"] > 0 else 1.0, 0.85, 1.15))
+    a_def_reg_mult = float(np.clip(a_regressed_xga / auto_away_sos["season_xga"] if auto_away_sos["season_xga"] > 0 else 1.0, 0.85, 1.15))
 
-    with st.expander("3. Travel Distance & Fatigue", expanded=False):
-        away_travel_km = st.number_input("Away Travel Distance (km)", value=0.0, step=100.0)
-        away_travel_mult = max(0.90, 1.0 - (away_travel_km / 25000.0))
-        st.caption(f"Away Travel Penalty: **{fmt_num(away_travel_mult)}x**")
+    # FIX 2: Strict HFA Decay directly in the UI dashboard 
+    h_att_reg_mult *= 1.03
+    h_def_reg_mult *= 0.97
+    a_att_reg_mult *= 0.97
+    a_def_reg_mult *= 1.03
 
-    with st.expander("4. Cards & Referee Strictness", expanded=False):
-        league_defaults = LEAGUE_DISCIPLINE_STATS.get(league, {"avg_fouls": 22.0, "avg_cards": 4.5})
-        c_rc1, c_rc2 = st.columns(2)
-        with c_rc1: h_fouls, ref_cards = st.number_input("Home Avg Fouls", value=league_defaults["avg_fouls"]/2, step=0.5), st.number_input("Referee Avg Cards", value=league_defaults["avg_cards"], step=0.1)
-        with c_rc2: a_fouls, league_cards = st.number_input("Away Avg Fouls", value=league_defaults["avg_fouls"]/2, step=0.5), st.number_input("League Avg Cards", value=league_defaults["avg_cards"], step=0.1)
+    st.caption(f"**{home_team}:** Attack **{h_att_reg_mult:.2f}x** | Defense **{h_def_reg_mult:.2f}x**")
+    st.caption(f"**{away_team}:** Attack **{a_att_reg_mult:.2f}x** | Defense **{a_def_reg_mult:.2f}x**")
 
-        expected_cards = ref_cards * ((h_fouls + a_fouls) / league_defaults["avg_fouls"])
-        adjusted_rho = -0.06 * (expected_cards / league_cards if league_cards > 0 else 1.0)
+with st.sidebar.expander("2. Tactical Pressing (PPDA & Tilt)", expanded=False):
+    c_p1, c_p2 = st.columns(2)
+    with c_p1: h_ppda = st.number_input(f"{home_team} PPDA", value=12.0, step=0.5)
+    with c_p2: a_ppda = st.number_input(f"{away_team} PPDA", value=12.0, step=0.5)
+    tilt_diff = st.number_input("Field Tilt Diff (%)", value=0.0, step=1.0)
+    
+    h_press_mult = float(np.clip((1.0 + 0.05 * ((a_ppda / h_ppda if h_ppda > 0 else 1.0) - 1.0)) * (1.0 + tilt_diff/100 * 0.05), 0.85, 1.15))
+    a_press_mult = float(np.clip((1.0 + 0.05 * ((h_ppda / a_ppda if a_ppda > 0 else 1.0) - 1.0)) * (1.0 - tilt_diff/100 * 0.05), 0.85, 1.15))
+    st.caption(f"Multiplier: Home **{h_press_mult:.2f}x** | Away **{a_press_mult:.2f}x**")
 
-        # MATH FIX 1: Clamp adjusted_rho to prevent math breakdown / negative tau values
-        adjusted_rho = float(np.clip(adjusted_rho, -0.15, 0.05))
-        st.caption(f"Expected Match Cards: **{fmt_num(expected_cards)}** | Adjusted Dixon-Coles ρ: **{fmt_num(adjusted_rho)}**")
+with st.sidebar.expander("3. Travel Distance & Fatigue", expanded=False):
+    away_travel_km = st.number_input("Away Travel Distance (km)", value=0.0, step=100.0)
+    away_travel_mult = max(0.90, 1.0 - (away_travel_km / 25000.0))
+    st.caption(f"Away Travel Penalty: **{away_travel_mult:.2f}x**")
 
-with tab_lineup:
-    rating_window = st.slider("Player Form Window (games)", 3, 5, 5)
+with st.sidebar.expander("4. Cards & Referee Strictness", expanded=False):
+    league_defaults = LEAGUE_DISCIPLINE_STATS.get(league, {"avg_fouls": 22.0, "avg_cards": 4.5})
+    c_rc1, c_rc2 = st.columns(2)
+    with c_rc1: h_fouls, ref_cards = st.number_input("Home Avg Fouls", value=league_defaults["avg_fouls"]/2, step=0.5), st.number_input("Referee Avg Cards", value=league_defaults["avg_cards"], step=0.1)
+    with c_rc2: a_fouls, league_cards = st.number_input("Away Avg Fouls", value=league_defaults["avg_fouls"]/2, step=0.5), st.number_input("League Avg Cards", value=league_defaults["avg_cards"], step=0.1)
+        
+    expected_cards = ref_cards * ((h_fouls + a_fouls) / league_defaults["avg_fouls"])
+    adjusted_rho = -0.06 * (expected_cards / league_cards if league_cards > 0 else 1.0)
+    adjusted_rho = float(np.clip(adjusted_rho, -0.15, 0.05))
+    st.caption(f"Expected Match Cards: **{expected_cards:.1f}** | Adjusted Dixon-Coles ρ: **{adjusted_rho:.3f}**")
 
-    home_squad_raw = fetch_squad(home_team, league_name=league, seed_offset=1, n_games=rating_window)
-    away_squad_raw = fetch_squad(away_team, league_name=league, seed_offset=2, n_games=rating_window)
+st.sidebar.divider()
+st.sidebar.subheader("Player Availability")
+rating_window = st.sidebar.slider("Player Form Window (games)", 3, 5, 5)
 
-    with st.expander(f"🏠 {home_team} Lineup"):
-        home_active = {row["player"]: st.checkbox(f"{row['player']} ({row['position']})", value=True, key=f"h_{row['player']}") for _, row in home_squad_raw.iterrows()}
+home_squad_raw = fetch_squad(home_team, league_name=league, seed_offset=1, n_games=rating_window)
+away_squad_raw = fetch_squad(away_team, league_name=league, seed_offset=2, n_games=rating_window)
 
-    with st.expander(f"🚗 {away_team} Lineup"):
-        away_active = {row["player"]: st.checkbox(f"{row['player']} ({row['position']})", value=True, key=f"a_{row['player']}") for _, row in away_squad_raw.iterrows()}
+with st.sidebar.expander(f"🏠 {home_team} Lineup"):
+    home_active = {row["player"]: st.checkbox(f"{row['player']} ({row['position']})", value=True, key=f"h_{row['player']}") for _, row in home_squad_raw.iterrows()}
+
+with st.sidebar.expander(f"🚗 {away_team} Lineup"):
+    away_active = {row["player"]: st.checkbox(f"{row['player']} ({row['position']})", value=True, key=f"a_{row['player']}") for _, row in away_squad_raw.iterrows()}
 
 # ====================================================================================
 # 8. COMPUTATION & DATA PROCESSING
@@ -1173,24 +1112,23 @@ else:
     base_lam_home, base_lam_away, home_tier_info, away_tier_info, league_home_avg_used, league_away_avg_used = calculate_team_base_lambdas(home_team, away_team, season_stats)
     lambda_source = "live standings" if FOOTBALL_DATA_KEY else "mock season stats"
 
-with tab_match:
-    st.divider()
-    st.subheader("⚙️ Team Rating Engine Controls")
-    rating_mode = st.radio("Rating Mode", options=["Automated (Data-Driven)", "Custom Manual Override"], index=0)
+st.sidebar.divider()
+st.sidebar.subheader("⚙️ Team Rating Engine Controls")
+rating_mode = st.sidebar.radio("Rating Mode", options=["Automated (Data-Driven)", "Custom Manual Override"], index=0)
 
-    if rating_mode == "Automated (Data-Driven)":
-        st.success("🟢 Ratings auto-synced from data source")
-        col1, col2 = st.columns(2)
-        with col1: st.metric(f"{home_team} α (Att)", fmt_num(home_tier_info["attack"])); st.metric(f"{home_team} β (Def)", fmt_num(home_tier_info["defense"]))
-        with col2: st.metric(f"{away_team} α (Att)", fmt_num(away_tier_info["attack"])); st.metric(f"{away_team} β (Def)", fmt_num(away_tier_info["defense"]))
-        ratings_overridden = False
-    else:
-        st.warning("✏️ Custom override active")
-        c1, c2 = st.columns(2)
-        with c1: st.markdown(f"**{home_team}**"); home_attack_eff = st.number_input("Attack (α)", 0.10, 3.00, value=float(home_tier_info["attack"]), step=0.05, key="h_att_c"); home_defense_eff = st.number_input("Defense (β)", 0.10, 3.00, value=float(home_tier_info["defense"]), step=0.05, key="h_def_c")
-        with c2: st.markdown(f"**{away_team}**"); away_attack_eff = st.number_input("Attack (α)", 0.10, 3.00, value=float(away_tier_info["attack"]), step=0.05, key="a_att_c"); away_defense_eff = st.number_input("Defense (β)", 0.10, 3.00, value=float(away_tier_info["defense"]), step=0.05, key="a_def_c")
-        ratings_overridden = True
-        base_lam_home, base_lam_away = round(league_home_avg_used * home_attack_eff * away_defense_eff, 3), round(league_away_avg_used * away_attack_eff * home_defense_eff, 3)
+if rating_mode == "Automated (Data-Driven)":
+    st.sidebar.success("🟢 Ratings auto-synced from data source")
+    col1, col2 = st.sidebar.columns(2)
+    with col1: st.metric(f"{home_team} α (Att)", home_tier_info["attack"]); st.metric(f"{home_team} β (Def)", home_tier_info["defense"])
+    with col2: st.metric(f"{away_team} α (Att)", away_tier_info["attack"]); st.metric(f"{away_team} β (Def)", away_tier_info["defense"])
+    ratings_overridden = False
+else:
+    st.sidebar.warning("✏️ Custom override active")
+    c1, c2 = st.sidebar.columns(2)
+    with c1: st.markdown(f"**{home_team}**"); home_attack_eff = st.number_input("Attack (α)", 0.10, 3.00, value=float(home_tier_info["attack"]), step=0.05, key="h_att_c"); home_defense_eff = st.number_input("Defense (β)", 0.10, 3.00, value=float(home_tier_info["defense"]), step=0.05, key="h_def_c")
+    with c2: st.markdown(f"**{away_team}**"); away_attack_eff = st.number_input("Attack (α)", 0.10, 3.00, value=float(away_tier_info["attack"]), step=0.05, key="a_att_c"); away_defense_eff = st.number_input("Defense (β)", 0.10, 3.00, value=float(away_tier_info["defense"]), step=0.05, key="a_def_c")
+    ratings_overridden = True
+    base_lam_home, base_lam_away = round(league_home_avg_used * home_attack_eff * away_defense_eff, 3), round(league_away_avg_used * away_attack_eff * home_defense_eff, 3)
 
 home_form_df, away_form_df = fetch_team_form(home_team, league), fetch_team_form(away_team, league)
 home_piv_mult, home_squad = player_impact_score(home_squad_raw, home_active)
@@ -1202,15 +1140,25 @@ away_model = TeamModelInputs(name=away_team, base_lambda=base_lam_away, piv_mult
 lam_home_1x2, lam_away_1x2 = home_model.lambda_1x2, away_model.lambda_1x2
 lam_home_tot, lam_away_tot = home_model.lambda_totals, away_model.lambda_totals
 
-# --- BIVARIATE BTTS COPULA INFLATION CALCULATION ---
-btts_correlation_1x2 = float(np.clip(1.0 + 0.04 * (lam_home_1x2 + lam_away_1x2 - 2.5), 1.0, 1.15))
 btts_correlation_tot = float(np.clip(1.0 + 0.04 * (lam_home_tot + lam_away_tot - 2.5), 1.0, 1.15))
 
-matrix_1x2 = scoreline_matrix(lam_home_1x2, lam_away_1x2, max_goals=9, rho=adjusted_rho, btts_mult=btts_correlation_1x2)
-matrix_tot = scoreline_matrix(lam_home_tot, lam_away_tot, max_goals=9, rho=adjusted_rho, btts_mult=btts_correlation_tot)
+matrix_1x2 = scoreline_matrix(lam_home_1x2, lam_away_1x2, max_goals=9, rho=adjusted_rho, btts_mult=1.0, overdispersion=False)
+matrix_tot = scoreline_matrix(lam_home_tot, lam_away_tot, max_goals=9, rho=adjusted_rho, btts_mult=1.0, overdispersion=True)
+matrix_btts = scoreline_matrix(lam_home_tot, lam_away_tot, max_goals=9, rho=adjusted_rho, btts_mult=btts_correlation_tot, overdispersion=False)
 
-probs_1x2, probs_tot = derive_markets(matrix_1x2), derive_markets(matrix_tot)
-model_probs = {"1X2": probs_1x2["1X2"], "over_2_5": probs_tot["over_2_5"], "under_2_5": probs_tot["under_2_5"], "btts_yes": probs_tot["btts_yes"], "btts_no": probs_tot["btts_no"], "ah_home_-0.5": probs_1x2["ah_home_-0.5"], "ah_away_+0.5": probs_1x2["ah_away_+0.5"]}
+probs_1x2 = derive_markets(matrix_1x2)
+probs_tot = derive_markets(matrix_tot)
+probs_btts = derive_markets(matrix_btts)
+
+model_probs = {
+    "1X2": probs_1x2["1X2"], 
+    "over_2_5": probs_tot["over_2_5"], 
+    "under_2_5": probs_tot["under_2_5"], 
+    "btts_yes": probs_btts["btts_yes"], 
+    "btts_no": probs_btts["btts_no"], 
+    "ah_home_-0.5": probs_1x2["ah_home_-0.5"], 
+    "ah_away_+0.5": probs_1x2["ah_away_+0.5"]
+}
 
 market_odds = fetch_market_odds(home_team, away_team, league)
 model_odds_1x2 = apply_margin(model_probs["1X2"], target_margin)
@@ -1222,73 +1170,6 @@ model_odds_btts = apply_margin({"btts_yes": model_probs["btts_yes"], "btts_no": 
 # ====================================================================================
 st.title(f"{home_team} vs {away_team}")
 st.caption(f"{league} · Kickoff {kickoff.strftime('%A %d %B, %H:%M')} · Venue: {city}")
-
-# Odds/edge computation moved up so the top-signal callout can use it
-# immediately — the render (styled table) stays in the Odds Engine section
-# below, this block only computes trade_rows.
-book_1x2 = market_odds.get("1X2", {})
-devig_1x2 = devig_proportional(book_1x2.get("home", 0), book_1x2.get("draw", 0), book_1x2.get("away", 0))
-devig_ou = devig_two_way(market_odds.get("over_2_5"), market_odds.get("under_2_5"))
-devig_btts = devig_two_way(market_odds.get("btts_yes"), market_odds.get("btts_no"))
-
-def build_trade_row(market_label, model_prob, model_odd, book_odd, fair_mkt_prob):
-    if not book_odd or book_odd <= 1.0: return {"Market": market_label, "Model Odds": fmt_num(model_odd), "Consensus Odds": "N/A", "Edge (pp)": "0", "Kelly Stake %": "0%", "Signal": "N/A"}
-
-    devigged = True
-    if fair_mkt_prob is None:
-        fair_mkt_prob = 1 / book_odd
-        devigged = False
-
-    edge_pp = round((model_prob - fair_mkt_prob) * 100, 2)
-    stake_pct = kelly_stake(model_prob, book_odd, kelly_fraction, max_stake_cap)
-
-    if not devigged: 
-        signal = "⚠️ NO DEVIG"
-    else: 
-        if edge_pp >= 2.0 and stake_pct > 0:
-            if book_odd > max_odds_cap: signal = "🟡 EDGE (Odds > Cap)"
-            elif model_odd >= min_model_conf: signal = "🟡 EDGE (Model Conf < Cap)"
-            else: signal = "🟢 VALUE (PLAY)"
-        elif edge_pp <= -2.0: signal = "🔴 OVERPRICED"
-        else: signal = "⚪ FAIR"
-
-    return {"Market": market_label, "Model Prob %": fmt_num(model_prob * 100), "Model Odds": fmt_num(model_odd), "Consensus Odds": fmt_num(book_odd), "Fair Market Prob %": fmt_num(fair_mkt_prob * 100), "Edge (pp)": fmt_num(edge_pp), "Kelly Stake %": f"{fmt_num(stake_pct)}%", "Signal": signal}
-
-fair_mkt_h, fair_mkt_d, fair_mkt_a = devig_1x2 if devig_1x2 else (None, None, None)
-fair_ou_over, fair_ou_under = devig_ou if devig_ou else (None, None)
-fair_btts_yes, fair_btts_no = devig_btts if devig_btts else (None, None)
-
-trade_rows = [
-    build_trade_row(f"1X2 — {home_team} Win", model_probs["1X2"]["home"], model_odds_1x2["home"], book_1x2.get("home"), fair_mkt_h),
-    build_trade_row("1X2 — Draw", model_probs["1X2"]["draw"], model_odds_1x2["draw"], book_1x2.get("draw"), fair_mkt_d),
-    build_trade_row(f"1X2 — {away_team} Win", model_probs["1X2"]["away"], model_odds_1x2["away"], book_1x2.get("away"), fair_mkt_a),
-    build_trade_row("Over 2.5 Goals", model_probs["over_2_5"], model_odds_totals["over_2_5"], market_odds.get("over_2_5"), fair_ou_over),
-    build_trade_row("Under 2.5 Goals", model_probs["under_2_5"], model_odds_totals["under_2_5"], market_odds.get("under_2_5"), fair_ou_under),
-    build_trade_row("BTTS — Yes", model_probs["btts_yes"], model_odds_btts["btts_yes"], market_odds.get("btts_yes"), fair_btts_yes),
-]
-
-# --- Top Signal callout: surfaces the best qualifying play (if any) right
-# under the title, so it's not buried at the bottom of a table you have to
-# scroll to and scan row-by-row every time. ---
-play_rows = [r for r in trade_rows if r["Signal"] == "🟢 VALUE (PLAY)"]
-if play_rows:
-    best = max(play_rows, key=lambda r: float(r["Edge (pp)"]))
-    edge_val = float(best["Edge (pp)"])
-    edge_str = f"+{best['Edge (pp)']}" if edge_val > 0 else best["Edge (pp)"]
-    st.markdown(f"""
-    <div class="signal-card play">
-        <div class="label">🟢 Top Signal</div>
-        <div class="headline">{best['Market']} — Model {best['Model Odds']} vs Consensus {best['Consensus Odds']}
-        &nbsp;·&nbsp; Edge {edge_str}pp &nbsp;·&nbsp; Kelly Stake {best['Kelly Stake %']}</div>
-    </div>
-    """, unsafe_allow_html=True)
-else:
-    st.markdown("""
-    <div class="signal-card none">
-        <div class="label">No Qualifying Signal</div>
-        <div class="headline">Every market is FAIR, OVERPRICED, or filtered by your Value Safety caps right now.</div>
-    </div>
-    """, unsafe_allow_html=True)
 
 def _tier_warning(team_name: str, info: dict) -> Optional[str]:
     if info["tier"] == "second-tier (promotion-adjusted)": return f"ℹ️ {team_name} using {info['n']} second-tier matches (promotion-adjusted)."
@@ -1303,21 +1184,17 @@ if "historical CSV" in lambda_source:
 
 c1, c2, c3, c4 = st.columns(4)
 with c1:
-    with st.container(border=True):
-        st.metric("λ Home (1X2 | Totals)", f"{fmt_num(lam_home_1x2)} | {fmt_num(lam_home_tot)}")
-        st.caption(f"Combined Multiplier: **{fmt_num(home_model.combined_multiplier)}x**")
+    st.metric("λ Home (1X2 | Totals)", f"{lam_home_1x2} | {lam_home_tot}")
+    st.caption(f"Combined Multiplier: **{home_model.combined_multiplier:.2f}x**")
 with c2:
-    with st.container(border=True):
-        st.metric("λ Away (1X2 | Totals)", f"{fmt_num(lam_away_1x2)} | {fmt_num(lam_away_tot)}")
-        st.caption(f"Combined Multiplier: **{fmt_num(away_model.combined_multiplier)}x**")
+    st.metric("λ Away (1X2 | Totals)", f"{lam_away_1x2} | {lam_away_tot}")
+    st.caption(f"Combined Multiplier: **{away_model.combined_multiplier:.2f}x**")
 with c3:
-    with st.container(border=True):
-        st.metric(f"BTTS Correlation (γ)", fmt_num(btts_correlation_tot))
-        st.caption("Auto-scales mutual scoring probability for open matches.")
+    st.metric(f"BTTS Correlation (γ)", f"{btts_correlation_tot:.3f}")
+    st.caption("Auto-scales mutual scoring probability for open matches.")
 with c4:
-    with st.container(border=True):
-        st.metric("🌡️ Temp", f"{fmt_num(weather['temperature_c'])}°C")
-        st.metric("💨 Wind", f"{fmt_num(weather['wind_speed_kmh'])} km/h")
+    st.metric("🌡️ Temp", f"{weather['temperature_c']}°C")
+    st.metric("💨 Wind", f"{weather['wind_speed_kmh']} km/h")
 
 with st.expander("📊 Rating Calculation Breakdown"):
     primary_league_name = league
@@ -1325,10 +1202,10 @@ with st.expander("📊 Rating Calculation Breakdown"):
     summary_rows = []
     for team_name, info in ((home_team, home_tier_info), (away_team, away_tier_info)):
         if info["tier"] == "second-tier (promotion-adjusted)":
-            summary_rows.append({"Team": team_name, "Context": f"{secondary_league_name} Baseline", "Attack Rating (α)": fmt_num(info["raw_attack"]), "Defense Rating (β)": fmt_num(info["raw_defense"])})
-            summary_rows.append({"Team": team_name, "Context": f"{primary_league_name} Adjusted", "Attack Rating (α)": fmt_num(info["attack"]), "Defense Rating (β)": fmt_num(info["defense"])})
+            summary_rows.append({"Team": team_name, "Context": f"{secondary_league_name} Baseline", "Attack Rating (α)": info["raw_attack"], "Defense Rating (β)": info["raw_defense"]})
+            summary_rows.append({"Team": team_name, "Context": f"{primary_league_name} Adjusted", "Attack Rating (α)": info["attack"], "Defense Rating (β)": info["defense"]})
         else:
-            summary_rows.append({"Team": team_name, "Context": f"{primary_league_name} Baseline", "Attack Rating (α)": fmt_num(info["attack"]), "Defense Rating (β)": fmt_num(info["defense"])})
+            summary_rows.append({"Team": team_name, "Context": f"{primary_league_name} Baseline", "Attack Rating (α)": info["attack"], "Defense Rating (β)": info["defense"]})
     st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
 
 st.divider()
@@ -1340,47 +1217,72 @@ st.caption(f"Squad data source — {home_team}: **{home_squad_source}** · {away
 
 pc1, pc2 = st.columns(2)
 display_cols = ["player", "position", "avg_rating", "games_rated", "xG90", "xA90", "status", "absence_penalty_%"]
-numeric_display_cols = ["avg_rating", "xG90", "xA90", "absence_penalty_%"]
-
-def _format_squad_for_display(squad_df: pd.DataFrame) -> pd.DataFrame:
-    sorted_df = squad_df[display_cols].sort_values("avg_rating", ascending=False, na_position="last").copy()
-    for col in numeric_display_cols:
-        sorted_df[col] = sorted_df[col].apply(lambda v: fmt_num(v) if pd.notna(v) else v)
-    return sorted_df
-
 with pc1:
     st.markdown(f"**{home_team} Lineup & Stats**")
-    st.dataframe(_format_squad_for_display(home_squad), hide_index=True)
+    st.dataframe(home_squad[display_cols].sort_values("avg_rating", ascending=False, na_position="last"), hide_index=True)
 with pc2:
     st.markdown(f"**{away_team} Lineup & Stats**")
-    st.dataframe(_format_squad_for_display(away_squad), hide_index=True)
+    st.dataframe(away_squad[display_cols].sort_values("avg_rating", ascending=False, na_position="last"), hide_index=True)
 
 st.divider()
 
 st.subheader("💰 Odds Engine, Consensus Market & Kelly Staking")
 
-# Table now just renders trade_rows (computed above, near the Top Signal
-# callout) — with per-row background tinting on the Signal column so the
-# scan is visual, not "read every emoji in a plain grid."
-def _style_signal(row):
-    styles = [""] * len(row)
-    idx = row.index.get_loc("Signal")
-    val = row["Signal"]
-    if "PLAY" in val: styles[idx] = "background-color: rgba(245,165,36,0.22); font-weight: 600;"
-    elif "VALUE" in val or "EDGE" in val: styles[idx] = "background-color: rgba(20,184,166,0.18);"
-    elif "OVERPRICED" in val: styles[idx] = "background-color: rgba(239,68,68,0.16);"
-    elif "NO DEVIG" in val: styles[idx] = "background-color: rgba(148,163,184,0.14);"
-    return styles
+book_1x2 = market_odds.get("1X2", {})
+devig_1x2 = devig_proportional(book_1x2.get("home", 0), book_1x2.get("draw", 0), book_1x2.get("away", 0))
+devig_ou = devig_two_way(market_odds.get("over_2_5"), market_odds.get("under_2_5"))
+devig_btts = devig_two_way(market_odds.get("btts_yes"), market_odds.get("btts_no"))
 
-trade_df = pd.DataFrame(trade_rows)
-st.dataframe(trade_df.style.apply(_style_signal, axis=1), hide_index=True, use_container_width=True)
+def build_trade_row(market_label, raw_model_prob, book_odd, fair_mkt_prob):
+    if not book_odd or book_odd <= 1.0: return {"Market": market_label, "Model Calibrated Odds": "N/A", "Consensus Odds": "N/A", "Edge (pp)": 0, "Kelly Stake %": "0.0%", "Signal": "N/A"}
+
+    devigged = True
+    if fair_mkt_prob is None:
+        fair_mkt_prob = 1 / book_odd
+        devigged = False
+
+    calibrated_prob = (0.50 * raw_model_prob) + (0.50 * fair_mkt_prob)
+    calibrated_odds = round(1.0 / calibrated_prob, 2) if calibrated_prob > 0 else float('inf')
+
+    edge_pp = round((calibrated_prob - fair_mkt_prob) * 100, 2)
+    expected_value = (calibrated_prob * book_odd) - 1.0
+    stake_pct = kelly_stake(calibrated_prob, book_odd, kelly_fraction, max_stake_cap)
+
+    if not devigged: 
+        signal = "⚠️ NO DEVIG"
+    elif expected_value > 0.15:
+        signal = "⚠️ ANOMALY (>15% EV)"
+    else: 
+        if edge_pp >= 2.0 and stake_pct > 0:
+            if book_odd > max_odds_cap: signal = "🟡 EDGE (Odds > Cap)"
+            elif calibrated_odds >= min_model_conf: signal = "🟡 EDGE (Model Conf < Cap)"
+            else: signal = "🟢 VALUE (PLAY)"
+        elif edge_pp <= -2.0: signal = "🔴 OVERPRICED"
+        else: signal = "⚪ FAIR"
+
+    return {"Market": market_label, "Calibrated Prob %": round(calibrated_prob * 100, 1), "Model Calibrated Odds": calibrated_odds, "Consensus Odds": book_odd, "Fair Market Prob %": round(fair_mkt_prob * 100, 1), "Edge (pp)": edge_pp, "Kelly Stake %": f"{stake_pct}%", "Signal": signal}
+
+fair_mkt_h, fair_mkt_d, fair_mkt_a = devig_1x2 if devig_1x2 else (None, None, None)
+fair_ou_over, fair_ou_under = devig_ou if devig_ou else (None, None)
+fair_btts_yes, fair_btts_no = devig_btts if devig_btts else (None, None)
+
+trade_rows = [
+    build_trade_row(f"1X2 — {home_team} Win", model_probs["1X2"]["home"], book_1x2.get("home"), fair_mkt_h),
+    build_trade_row("1X2 — Draw", model_probs["1X2"]["draw"], book_1x2.get("draw"), fair_mkt_d),
+    build_trade_row(f"1X2 — {away_team} Win", model_probs["1X2"]["away"], book_1x2.get("away"), fair_mkt_a),
+    build_trade_row("Over 2.5 Goals", model_probs["over_2_5"], market_odds.get("over_2_5"), fair_ou_over),
+    build_trade_row("Under 2.5 Goals", model_probs["under_2_5"], market_odds.get("under_2_5"), fair_ou_under),
+    build_trade_row("BTTS — Yes", model_probs["btts_yes"], market_odds.get("btts_yes"), fair_btts_yes),
+]
+
+st.dataframe(pd.DataFrame(trade_rows), hide_index=True)
+st.caption("Note: 'Model Calibrated Odds' uses 50/50 Empirical Bayes Shrinkage toward the sharp market baseline to prevent overconfidence.")
 if market_odds.get("source"): st.caption(f"Odds Source: {market_odds['source']}")
 
 st.divider()
 
 st.subheader("🔥 Scoreline Probability Matrix Heatmap (1X2 Base)")
 heat_labels = list(range(matrix_1x2.shape[0]))
-heat_text = np.array([[fmt_num(v) for v in row] for row in (matrix_1x2 * 100)])
-fig = go.Figure(data=go.Heatmap(z=matrix_1x2 * 100, x=[f"{away_team} {g}" for g in heat_labels], y=[f"{home_team} {g}" for g in heat_labels], colorscale="YlOrRd", text=heat_text, texttemplate="%{text}%", textfont={"size": 11}, hoverongaps=False))
-fig.update_layout(title=f"Scoreline Distribution (%) — Dixon-Coles ρ: {fmt_num(adjusted_rho)} | BTTS γ: {fmt_num(btts_correlation_1x2)}", xaxis_title=f"Away Goals ({away_team})", yaxis_title=f"Home Goals ({home_team})", height=500, margin=dict(l=40, r=40, t=50, b=40))
+fig = go.Figure(data=go.Heatmap(z=matrix_1x2 * 100, x=[f"{away_team} {g}" for g in heat_labels], y=[f"{home_team} {g}" for g in heat_labels], colorscale="YlOrRd", text=np.round(matrix_1x2 * 100, 1), texttemplate="%{text}%", textfont={"size": 11}, hoverongaps=False))
+fig.update_layout(title=f"Scoreline Distribution (%) — Dixon-Coles ρ: {adjusted_rho:.3f} | BTTS γ: 1.0 (Copula Isolated)", xaxis_title=f"Away Goals ({away_team})", yaxis_title=f"Home Goals ({home_team})", height=500, margin=dict(l=40, r=40, t=50, b=40))
 st.plotly_chart(fig)
