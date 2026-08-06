@@ -695,6 +695,10 @@ def fetch_team_form(team_name: str, league_name: str = "Premier League") -> pd.D
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_market_odds(home_team: str, away_team: str, league_name: str = "Premier League") -> dict:
+    """
+    Fetches odds from The Odds API and calculates the mathematical average 
+    (Consensus) across all available bookmakers.
+    """
     sport_key = ODDS_API_SPORT_KEYS.get(league_name, "soccer_epl")
     if not THE_ODDS_API_KEY: 
         return _mock_odds(home_team, away_team)
@@ -802,16 +806,6 @@ def player_impact_score(squad: pd.DataFrame, active_mask: dict, is_facing_promot
     return round(piv_multiplier, 3), squad
 
 
-def form_multiplier(form_df: pd.DataFrame) -> float:
-    weights = np.array([0.10, 0.15, 0.20, 0.25, 0.30])
-    df = form_df.sort_values("matches_ago", ascending=False).reset_index(drop=True)
-    if len(df) < 5:
-        weights = weights[-len(df):] / weights[-len(df):].sum()
-    match_scores = 0.4 * df["goals_for"] + 0.6 * df["xG_for"]
-    weighted_score = float((match_scores * weights).sum())
-    return round(weighted_score / 1.45, 3)
-
-
 def team_form_rating_0_100(form_df: pd.DataFrame) -> float:
     weights = np.array([0.10, 0.15, 0.20, 0.25, 0.30])
     df = form_df.sort_values("matches_ago", ascending=False).reset_index(drop=True)
@@ -843,7 +837,6 @@ class TeamModelInputs:
     name: str
     base_lambda: float
     piv_multiplier: float
-    form_mult: float
     form_rating: float
     weather_mult: float
     rest_mult: float
@@ -857,7 +850,7 @@ class TeamModelInputs:
     def lambda_final(self) -> float:
         # Cross-pollination: xg_def_reg_mult_opponent is used because the OPPONENT'S 
         # defensive vulnerability increases THIS team's final scoring expectation.
-        val = self.base_lambda * self.piv_multiplier * self.form_mult * self.weather_mult * self.rest_mult * self.xg_att_reg_mult * self.xg_def_reg_mult_opponent * self.press_mult * self.travel_mult
+        val = self.base_lambda * self.piv_multiplier * self.weather_mult * self.rest_mult * self.xg_att_reg_mult * self.xg_def_reg_mult_opponent * self.press_mult * self.travel_mult
         return round(max(val, 0.05), 3)
 
 
@@ -869,7 +862,7 @@ def dixon_coles_tau(x: int, y: int, lam_home: float, lam_away: float, rho: float
     return 1.0
 
 
-def scoreline_matrix(lam_home: float, lam_away: float, max_goals: int = 7, rho: float = -0.06) -> np.ndarray:
+def scoreline_matrix(lam_home: float, lam_away: float, max_goals: int = 9, rho: float = -0.06) -> np.ndarray:
     matrix = np.zeros((max_goals + 1, max_goals + 1))
     for i in range(max_goals + 1):
         for j in range(max_goals + 1):
@@ -1162,7 +1155,7 @@ away_piv_mult, away_squad = player_impact_score(away_squad_raw, away_active, is_
 
 home_model = TeamModelInputs(
     name=home_team, base_lambda=base_lam_home, piv_multiplier=home_piv_mult,
-    form_mult=form_multiplier(home_form_df), form_rating=team_form_rating_0_100(home_form_df),
+    form_rating=team_form_rating_0_100(home_form_df),
     weather_mult=w_mult, rest_mult=rest_modifier(home_rest), 
     xg_att_reg_mult=h_att_reg_mult, 
     xg_def_reg_mult_opponent=a_def_reg_mult, # Cross-pollinated defense multiplier
@@ -1171,7 +1164,7 @@ home_model = TeamModelInputs(
 
 away_model = TeamModelInputs(
     name=away_team, base_lambda=base_lam_away, piv_multiplier=away_piv_mult,
-    form_mult=form_multiplier(away_form_df), form_rating=team_form_rating_0_100(away_form_df),
+    form_rating=team_form_rating_0_100(away_form_df),
     weather_mult=w_mult, rest_mult=rest_modifier(away_rest), 
     xg_att_reg_mult=a_att_reg_mult, 
     xg_def_reg_mult_opponent=h_def_reg_mult, # Cross-pollinated defense multiplier
@@ -1179,7 +1172,7 @@ away_model = TeamModelInputs(
 )
 
 lam_home, lam_away = home_model.lambda_final, away_model.lambda_final
-matrix = scoreline_matrix(lam_home, lam_away, max_goals=7, rho=adjusted_rho)
+matrix = scoreline_matrix(lam_home, lam_away, max_goals=9, rho=adjusted_rho)
 model_probs = derive_markets(matrix)
 market_odds = fetch_market_odds(home_team, away_team, league)
 
