@@ -261,6 +261,61 @@ def calculate_historical_lambdas(
     return (round(float(lam_home), 3), round(float(lam_away), 3), home_info, away_info,
             round(float(league_home_avg_g), 3), round(float(league_away_avg_g), 3))
 
+def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matches: int = 5) -> dict:
+    default_res = {"gf": 1.5, "xgf": 1.5, "ga": 1.2, "xga": 1.2, "opp_def": 1.00, "opp_att": 1.00}
+    if hist_df.empty: return default_res
+
+    league_h_g = max(hist_df['FTHG'].mean(), 1.0)
+    league_a_g = max(hist_df['FTAG'].mean(), 1.0)
+    norm_name = _normalize_hist_team_name(team_name)
+
+    home_m = _match_hist_team_rows(hist_df, 'HomeTeam', team_name)
+    away_m = _match_hist_team_rows(hist_df, 'AwayTeam', team_name)
+    combined_matches = pd.concat([home_m, away_m]).sort_values('Date', ascending=False).head(n_matches)
+    
+    if combined_matches.empty: return default_res
+
+    gf_list, ga_list, xgf_list, xga_list, opp_def_list, opp_att_list = [], [], [], [], [], []
+
+    for _, row in combined_matches.iterrows():
+        is_home = _normalize_hist_team_name(row['HomeTeam']) == norm_name or norm_name in row['HomeTeam']
+        opp_name = row['AwayTeam'] if is_home else row['HomeTeam']
+
+        gf = row['FTHG'] if is_home else row['FTAG']
+        ga = row['FTAG'] if is_home else row['FTHG']
+        gf_list.append(gf)
+        ga_list.append(ga)
+
+        hs = row['HS'] if not pd.isna(row.get('HS')) else 10.0
+        as_ = row['AS'] if not pd.isna(row.get('AS')) else 10.0
+        hst = row['HST'] if not pd.isna(row.get('HST')) else 3.5
+        ast = row['AST'] if not pd.isna(row.get('AST')) else 3.5
+
+        xg_home = 0.32 * hst + 0.03 * max(0, hs - hst)
+        xg_away = 0.32 * ast + 0.03 * max(0, as_ - ast)
+
+        xgf_list.append(xg_home if is_home else xg_away)
+        xga_list.append(xg_away if is_home else xg_home)
+
+        opp_home_rows = _match_hist_team_rows(hist_df, 'HomeTeam', opp_name).head(38)
+        opp_away_rows = _match_hist_team_rows(hist_df, 'AwayTeam', opp_name).head(38)
+        
+        opp_gf_h = opp_home_rows['FTHG'].mean() if not opp_home_rows.empty else league_h_g
+        opp_ga_h = opp_home_rows['FTAG'].mean() if not opp_home_rows.empty else league_a_g
+        opp_gf_a = opp_away_rows['FTAG'].mean() if not opp_away_rows.empty else league_a_g
+        opp_ga_a = opp_away_rows['FTHG'].mean() if not opp_away_rows.empty else league_h_g
+
+        opp_att = ((opp_gf_h + opp_gf_a) / 2.0) / ((league_h_g + league_a_g) / 2.0)
+        opp_def = ((opp_ga_h + opp_ga_a) / 2.0) / ((league_h_g + league_a_g) / 2.0)
+
+        opp_att_list.append(opp_att)
+        opp_def_list.append(opp_def)
+
+    return {
+        "gf": round(float(np.mean(gf_list)), 2), "xgf": round(float(np.mean(xgf_list)), 2),
+        "ga": round(float(np.mean(ga_list)), 2), "xga": round(float(np.mean(xga_list)), 2),
+        "opp_def": round(float(np.mean(opp_def_list)), 2), "opp_att": round(float(np.mean(opp_att_list)), 2),
+    }
 
 # ====================================================================================
 # 3. MOCK DATA GENERATORS (DEMO FALLBACKS)
@@ -488,10 +543,6 @@ def _parse_players_stats_page(response_items: list, pos_map: dict, recent_rating
         assists_total = goals.get("assists") or 0
         name = info.get("name")
 
-        # Player Rating Logic:
-        # 1. Use recent form rating if they actually played in the recent window.
-        # 2. If they didn't play recently, fallback to their overall season average rating.
-        # 3. Only fallback to 6.8 if BOTH are entirely missing.
         season_rating_raw = games.get("rating")
         recent = recent_ratings.get(name)
         
@@ -644,10 +695,6 @@ def fetch_team_form(team_name: str, league_name: str = "Premier League") -> pd.D
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_market_odds(home_team: str, away_team: str, league_name: str = "Premier League") -> dict:
-    """
-    Fetches odds from The Odds API and calculates the mathematical average 
-    (Consensus) across all available bookmakers.
-    """
     sport_key = ODDS_API_SPORT_KEYS.get(league_name, "soccer_epl")
     if not THE_ODDS_API_KEY: 
         return _mock_odds(home_team, away_team)
@@ -915,6 +962,12 @@ match_row = fixtures_df.loc[fixtures_df["label"] == match_label].iloc[0]
 
 home_team, away_team, kickoff = match_row["home_team"], match_row["away_team"], match_row["kickoff"]
 
+# Fetch historical data EARLY so it can populate the advanced UI modifiers
+hist_code = HIST_LEAGUE_MAP.get(league, "E0")
+hist_df = fetch_historical_league_data(hist_code)
+secondary_code = HIST_SECONDARY_LEAGUE_MAP.get(hist_code)
+secondary_hist_df = fetch_historical_league_data(secondary_code) if secondary_code else pd.DataFrame()
+
 st.sidebar.divider()
 st.sidebar.subheader("Trading Parameters")
 target_margin = st.sidebar.slider("Target Model Margin (%)", 2.0, 8.0, 5.0, 0.5)
@@ -931,40 +984,41 @@ with c_r2:
 st.sidebar.divider()
 st.sidebar.subheader("🔬 Advanced Modifiers")
 
+auto_home_sos = fetch_team_recent_xg_and_sos(home_team, hist_df, n_matches=5)
+auto_away_sos = fetch_team_recent_xg_and_sos(away_team, hist_df, n_matches=5)
+
 with st.sidebar.expander("1. xG Regression & Opponent Strength", expanded=False):
-    st.caption("Adjusts for finishing/goalkeeping variance and opponent Strength of Schedule (SoS).")
+    st.caption("Auto-synced from historical db. Adjusts for finishing variance & SoS.")
     
-    st.markdown("**Home Team (Recent Form)**")
+    st.markdown(f"**{home_team} (Recent Form)**")
     c_h1, c_h2, c_h3 = st.columns(3)
     with c_h1:
-        h_gf = st.number_input(f"{home_team} GF", value=1.5, step=0.1)
-        h_xgf = st.number_input(f"{home_team} xGF", value=1.5, step=0.1)
+        h_gf = st.number_input(f"{home_team} GF", value=float(auto_home_sos["gf"]), step=0.1, key="h_gf_in")
+        h_xgf = st.number_input(f"{home_team} xGF", value=float(auto_home_sos["xgf"]), step=0.1, key="h_xgf_in")
     with c_h2:
-        h_ga = st.number_input(f"{home_team} GA", value=1.2, step=0.1)
-        h_xga = st.number_input(f"{home_team} xGA", value=1.2, step=0.1)
+        h_ga = st.number_input(f"{home_team} GA", value=float(auto_home_sos["ga"]), step=0.1, key="h_ga_in")
+        h_xga = st.number_input(f"{home_team} xGA", value=float(auto_home_sos["xga"]), step=0.1, key="h_xga_in")
     with c_h3:
-        h_opp_def = st.number_input("Opp Avg Def (β)", value=1.00, step=0.05, key="h_opp_d")
-        h_opp_att = st.number_input("Opp Avg Att (α)", value=1.00, step=0.05, key="h_opp_a")
+        h_opp_def = st.number_input("Opp Avg Def (β)", value=float(auto_home_sos["opp_def"]), step=0.05, key="h_opp_d")
+        h_opp_att = st.number_input("Opp Avg Att (α)", value=float(auto_home_sos["opp_att"]), step=0.05, key="h_opp_a")
 
-    st.markdown("**Away Team (Recent Form)**")
+    st.markdown(f"**{away_team} (Recent Form)**")
     c_a1, c_a2, c_a3 = st.columns(3)
     with c_a1:
-        a_gf = st.number_input(f"{away_team} GF", value=1.2, step=0.1)
-        a_xgf = st.number_input(f"{away_team} xGF", value=1.2, step=0.1)
+        a_gf = st.number_input(f"{away_team} GF", value=float(auto_away_sos["gf"]), step=0.1, key="a_gf_in")
+        a_xgf = st.number_input(f"{away_team} xGF", value=float(auto_away_sos["xgf"]), step=0.1, key="a_xgf_in")
     with c_a2:
-        a_ga = st.number_input(f"{away_team} GA", value=1.5, step=0.1)
-        a_xga = st.number_input(f"{away_team} xGA", value=1.5, step=0.1)
+        a_ga = st.number_input(f"{away_team} GA", value=float(auto_away_sos["ga"]), step=0.1, key="a_ga_in")
+        a_xga = st.number_input(f"{away_team} xGA", value=float(auto_away_sos["xga"]), step=0.1, key="a_xga_in")
     with c_a3:
-        a_opp_def = st.number_input("Opp Avg Def (β)", value=1.00, step=0.05, key="a_opp_d")
-        a_opp_att = st.number_input("Opp Avg Att (α)", value=1.00, step=0.05, key="a_opp_a")
+        a_opp_def = st.number_input("Opp Avg Def (β)", value=float(auto_away_sos["opp_def"]), step=0.05, key="a_opp_d")
+        a_opp_att = st.number_input("Opp Avg Att (α)", value=float(auto_away_sos["opp_att"]), step=0.05, key="a_opp_a")
 
-    # Opponent-Adjusted True xG
     h_true_xgf = h_xgf / h_opp_def if h_opp_def > 0 else h_xgf
     h_true_xga = h_xga / h_opp_att if h_opp_att > 0 else h_xga
     a_true_xgf = a_xgf / a_opp_def if a_opp_def > 0 else a_xgf
     a_true_xga = a_xga / a_opp_att if a_opp_att > 0 else a_xga
 
-    # 70/30 Regression Multipliers
     h_att_reg_mult = ((h_true_xgf * 0.70) + (h_gf * 0.30)) / h_xgf if h_xgf > 0 else 1.0
     h_def_reg_mult = ((h_true_xga * 0.70) + (h_ga * 0.30)) / h_xga if h_xga > 0 else 1.0
     a_att_reg_mult = ((a_true_xgf * 0.70) + (a_gf * 0.30)) / a_xgf if a_xgf > 0 else 1.0
@@ -1001,10 +1055,10 @@ with st.sidebar.expander("6. Cards & Referee Strictness", expanded=False):
     
     c_rc1, c_rc2 = st.columns(2)
     with c_rc1:
-        h_fouls = st.number_input("Home Avg Fouls", value=11.0, step=0.5)
+        h_fouls = st.number_input("Home Avg Fouls", value=league_defaults["avg_fouls"]/2, step=0.5)
         ref_cards = st.number_input("Referee Avg Cards", value=league_defaults["avg_cards"], step=0.1)
     with c_rc2:
-        a_fouls = st.number_input("Away Avg Fouls", value=11.0, step=0.5)
+        a_fouls = st.number_input("Away Avg Fouls", value=league_defaults["avg_fouls"]/2, step=0.5)
         league_cards = st.number_input("League Avg Cards", value=league_defaults["avg_cards"], step=0.1)
         
     expected_cards = ref_cards * ((h_fouls + a_fouls) / league_defaults["avg_fouls"])
@@ -1034,11 +1088,6 @@ with st.sidebar.expander(f"🚗 {away_team} Lineup"):
 city, lat, lon = _STADIUM_CITIES.get(league, ("London", 51.5072, -0.1276))
 weather = fetch_weather(lat, lon, kickoff)
 w_mult = weather_modifier(weather)
-
-hist_code = HIST_LEAGUE_MAP.get(league, "E0")
-hist_df = fetch_historical_league_data(hist_code)
-secondary_code = HIST_SECONDARY_LEAGUE_MAP.get(hist_code)
-secondary_hist_df = fetch_historical_league_data(secondary_code) if secondary_code else pd.DataFrame()
 
 lambda_source = "mock"
 home_tier_info = away_tier_info = {"tier": "n/a", "n": 0, "attack": 1.0, "defense": 1.0, "goals_for": None, "goals_against": None}
