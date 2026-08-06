@@ -2,7 +2,7 @@ import os
 import random
 import datetime as dt
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -149,11 +149,15 @@ HIST_TEAM_ALIASES = {
 }
 
 def normalize_team_name(name: str) -> str:
+    """Strips suffixes/prefixes and maps name variants to a single canonical key.
+    Used for matching against football-data.co.uk's CSV short-names only."""
     if not name:
         return ""
     n = name.strip()
+    
     suffixes = [" Football Club", " FC", " CF", " AFC", " SC", " SV"]
     prefixes = ["AFC ", "FC ", "CF ", "SC ", "SV "]
+    
     for p in prefixes:
         if n.startswith(p):
             n = n[len(p):].strip()
@@ -164,7 +168,16 @@ def normalize_team_name(name: str) -> str:
     clean_key = n.lower().replace("-", " ").replace("'", "").strip()
     return HIST_TEAM_ALIASES.get(clean_key, n).strip()
 
+
 def api_search_name(name: str) -> str:
+    """
+    BUGFIX: fetch_squad previously used normalize_team_name() (which maps to
+    football-data.co.uk's shorthand, e.g. "Atletico Madrid" -> "ath madrid")
+    as the literal search query sent to API-Football's /teams endpoint — a
+    DIFFERENT provider with its own official naming. That risks squad-fetch
+    failures for exactly the biggest clubs. This only strips suffixes/
+    prefixes, with no alias remapping, for API-Football searches.
+    """
     if not name:
         return ""
     n = name.strip()
@@ -177,6 +190,7 @@ def api_search_name(name: str) -> str:
     return n
 
 def is_team_match(name1: str, name2: str) -> bool:
+    """Robust fuzzy/canonical match checking between two team name strings."""
     if not name1 or not name2:
         return False
     norm1 = normalize_team_name(name1).casefold()
@@ -189,13 +203,16 @@ def is_team_match(name1: str, name2: str) -> bool:
             return True
     return False
 
+
 def _current_season_year() -> int:
     now = dt.datetime.now()
     return now.year if now.month >= 7 else now.year - 1
 
+
 def _recent_hist_season_codes(n: int = 3) -> list:
     start_year = _current_season_year()
     return [f"{str(y)[-2:]}{str(y + 1)[-2:]}" for y in range(start_year - n + 1, start_year + 1)]
+
 
 # ====================================================================================
 # 2. HISTORICAL DATA ENGINE (MULTI-SEASON ARCHIVE)
@@ -204,6 +221,7 @@ def _recent_hist_season_codes(n: int = 3) -> list:
 def fetch_historical_league_data(league_code: str = "E0") -> pd.DataFrame:
     seasons = _recent_hist_season_codes(3)
     dfs = []
+    
     for s in seasons:
         url = f"https://www.football-data.co.uk/mmz4281/{s}/{league_code}.csv"
         try:
@@ -214,27 +232,45 @@ def fetch_historical_league_data(league_code: str = "E0") -> pd.DataFrame:
             dfs.append(df_clean)
         except Exception:
             continue
+
     if dfs:
         combined = pd.concat(dfs, ignore_index=True)
         combined['Date'] = pd.to_datetime(combined['Date'], dayfirst=True, errors='coerce')
         return combined.sort_values('Date', ascending=False)
+    
     return pd.DataFrame()
 
+
 def _match_hist_team_rows(hist_df: pd.DataFrame, column: str, team_name: str) -> pd.DataFrame:
+    """
+    BUGFIX: previously filtered with `is_team_match` directly against every
+    row with no uniqueness check — if two different clubs both satisfied the
+    fuzzy substring match (the exact class of bug fixed earlier for "Real
+    Madrid"/"Real Sociedad"), their results would silently blend together.
+    Now tries an exact canonical match first, and only falls back to the
+    fuzzy match if it resolves to a SINGLE unique team in the column.
+    """
     if hist_df.empty or column not in hist_df.columns:
         return hist_df.iloc[0:0]
+
     target_norm = normalize_team_name(team_name).casefold()
     col = hist_df[column].astype(str)
+
     exact = hist_df[col.apply(lambda c: normalize_team_name(c).casefold() == target_norm)]
     if not exact.empty:
         return exact
+
     candidates = col.unique()
     hits = [c for c in candidates if is_team_match(c, team_name)]
     if len(hits) == 1:
         return hist_df[col == hits[0]]
+
     return hist_df.iloc[0:0]
 
-def _team_hist_side_stats(team_name: str, side: str, primary_df: pd.DataFrame, secondary_df: Optional[pd.DataFrame], league_home_avg_g: float, league_away_avg_g: float) -> dict:
+
+def _team_hist_side_stats(team_name: str, side: str, primary_df: pd.DataFrame,
+                           secondary_df: Optional[pd.DataFrame],
+                           league_home_avg_g: float, league_away_avg_g: float) -> dict:
     team_col = 'HomeTeam' if side == 'home' else 'AwayTeam'
     for_col = 'FTHG' if side == 'home' else 'FTAG'
     against_col = 'FTAG' if side == 'home' else 'FTHG'
@@ -272,8 +308,13 @@ def _team_hist_side_stats(team_name: str, side: str, primary_df: pd.DataFrame, s
             "tier": "no match — league average", "n": 0,
             "raw_attack": None, "raw_defense": None, "raw_goals_for": None, "raw_goals_against": None}
 
-def calculate_historical_lambdas(home_team: str, away_team: str, hist_df: pd.DataFrame, secondary_df: Optional[pd.DataFrame] = None) -> Tuple[float, float, dict, dict, float, float]:
-    empty_keys = {"attack": 1.0, "defense": 1.0, "raw_attack": None, "raw_defense": None, "raw_goals_for": None, "raw_goals_against": None, "goals_for": None, "goals_against": None}
+
+def calculate_historical_lambdas(
+    home_team: str, away_team: str, hist_df: pd.DataFrame,
+    secondary_df: Optional[pd.DataFrame] = None,
+) -> Tuple[float, float, dict, dict, float, float]:
+    empty_keys = {"attack": 1.0, "defense": 1.0, "raw_attack": None, "raw_defense": None,
+                  "raw_goals_for": None, "raw_goals_against": None, "goals_for": None, "goals_against": None}
     if hist_df.empty:
         empty_info = {**empty_keys, "tier": "no historical data", "n": 0}
         return 1.55, 1.20, empty_info, empty_info, 1.55, 1.20
@@ -287,39 +328,21 @@ def calculate_historical_lambdas(home_team: str, away_team: str, hist_df: pd.Dat
     lam_home = league_home_avg_g * home_info["attack"] * away_info["defense"]
     lam_away = league_away_avg_g * away_info["attack"] * home_info["defense"]
 
-    return (round(float(lam_home), 3), round(float(lam_away), 3), home_info, away_info, round(float(league_home_avg_g), 3), round(float(league_away_avg_g), 3))
+    return (round(float(lam_home), 3), round(float(lam_away), 3), home_info, away_info,
+            round(float(league_home_avg_g), 3), round(float(league_away_avg_g), 3))
 
 def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matches: int = 5) -> dict:
-    default_res = {"gf": 1.5, "xgf": 1.5, "ga": 1.2, "xga": 1.2, "opp_def": 1.00, "opp_att": 1.00, "season_gf": 1.5, "season_ga": 1.5}
+    default_res = {"gf": 1.5, "xgf": 1.5, "ga": 1.2, "xga": 1.2, "opp_def": 1.00, "opp_att": 1.00}
     if hist_df.empty: return default_res
 
     league_h_g = max(hist_df['FTHG'].mean(), 1.0)
     league_a_g = max(hist_df['FTAG'].mean(), 1.0)
 
-    # 1. LONG-TERM SEASON AVERAGES (Crucial fix for regression math)
-    home_all = _match_hist_team_rows(hist_df, 'HomeTeam', team_name).head(38)
-    away_all = _match_hist_team_rows(hist_df, 'AwayTeam', team_name).head(38)
-    
-    gf_all, ga_all = [], []
-    if not home_all.empty:
-        gf_all.extend(home_all['FTHG'].tolist())
-        ga_all.extend(home_all['FTAG'].tolist())
-    if not away_all.empty:
-        gf_all.extend(away_all['FTAG'].tolist())
-        ga_all.extend(away_all['FTHG'].tolist())
-        
-    season_gf = round(float(np.mean(gf_all)), 2) if gf_all else league_h_g
-    season_ga = round(float(np.mean(ga_all)), 2) if ga_all else league_a_g
-
-    # 2. RECENT FORM STATS
     home_m = _match_hist_team_rows(hist_df, 'HomeTeam', team_name)
     away_m = _match_hist_team_rows(hist_df, 'AwayTeam', team_name)
     combined_matches = pd.concat([home_m, away_m]).sort_values('Date', ascending=False).head(n_matches)
     
-    if combined_matches.empty: 
-        default_res["season_gf"] = season_gf
-        default_res["season_ga"] = season_ga
-        return default_res
+    if combined_matches.empty: return default_res
 
     gf_list, ga_list, xgf_list, xga_list, opp_def_list, opp_att_list = [], [], [], [], [], []
 
@@ -357,6 +380,10 @@ def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matche
         opp_att_list.append(opp_att)
         opp_def_list.append(opp_def)
 
+    # BUGFIX: recency weighting was lost when the rewrite replaced form_mult's
+    # weighted 5-match index with this scraper, which used a flat np.mean() —
+    # a match 4 days ago and one 5 weeks ago counted equally. Weight newest
+    # first, matching combined_matches' descending-date sort order.
     weights = np.array([0.30, 0.25, 0.20, 0.15, 0.10])
     if len(gf_list) < 5:
         weights = weights[:len(gf_list)] / weights[:len(gf_list)].sum()
@@ -368,8 +395,6 @@ def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matche
         "xga": round(float(np.average(xga_list, weights=weights)), 2),
         "opp_def": round(float(np.average(opp_def_list, weights=weights)), 2),
         "opp_att": round(float(np.average(opp_att_list, weights=weights)), 2),
-        "season_gf": season_gf,
-        "season_ga": season_ga
     }
 
 # ====================================================================================
@@ -390,6 +415,7 @@ def _mock_fixtures(league: str) -> pd.DataFrame:
         })
     return pd.DataFrame(fixtures)
 
+
 def _mock_season_stats(league: str) -> pd.DataFrame:
     random.seed(hash(league) % 2000)
     teams = LEAGUE_TEAM_POOLS.get(league, LEAGUE_TEAM_POOLS["Premier League"])
@@ -403,6 +429,7 @@ def _mock_season_stats(league: str) -> pd.DataFrame:
             "away_xG_against": round(random.uniform(0.9, 1.8), 2),
         })
     return pd.DataFrame(data)
+
 
 def _mock_squad(team: str, seed_offset: int = 0, n_games: int = 5) -> pd.DataFrame:
     random.seed((hash(team) + seed_offset) % 10000)
@@ -424,6 +451,7 @@ def _mock_squad(team: str, seed_offset: int = 0, n_games: int = 5) -> pd.DataFra
         })
     return pd.DataFrame(rows)
 
+
 def _mock_form(team: str) -> pd.DataFrame:
     random.seed(hash(team) % 5000)
     rows = []
@@ -436,6 +464,7 @@ def _mock_form(team: str) -> pd.DataFrame:
             "xG_against": round(max(0.2, np.random.normal(1.1, 0.3)), 2),
         })
     return pd.DataFrame(rows)
+
 
 def _mock_odds(home: str, away: str) -> dict:
     random.seed(hash(home + away) % 9999)
@@ -482,6 +511,7 @@ def fetch_weather(lat: float, lon: float, kickoff: dt.datetime) -> dict:
     except Exception:
         return {"temperature_c": 14.5, "precipitation_mm": 0.0, "wind_speed_kmh": 12.0, "source": "Mock Weather"}
 
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_fixtures(league_name: str) -> pd.DataFrame:
     league_code = LEAGUES.get(league_name)
@@ -500,6 +530,7 @@ def fetch_fixtures(league_name: str) -> pd.DataFrame:
         except Exception:
             pass
     return _mock_fixtures(league_name)
+
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_team_season_stats(league_name: str) -> pd.DataFrame:
@@ -536,6 +567,7 @@ def fetch_team_season_stats(league_name: str) -> pd.DataFrame:
         except Exception:
             pass
     return _mock_season_stats(league_name)
+
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_player_recent_ratings(team_id: int, league_name: str = "Premier League", n_games: int = 5) -> dict:
@@ -579,7 +611,9 @@ def fetch_player_recent_ratings(team_id: int, league_name: str = "Premier League
     except Exception:
         return {}
 
-def _parse_players_stats_page(response_items: list, pos_map: dict, recent_ratings: dict, fallback_xg90: dict, fallback_xa90: dict) -> list:
+
+def _parse_players_stats_page(response_items: list, pos_map: dict, recent_ratings: dict,
+                               fallback_xg90: dict, fallback_xa90: dict) -> list:
     rows = []
     for p in response_items:
         info = p.get("player", {})
@@ -620,6 +654,7 @@ def _parse_players_stats_page(response_items: list, pos_map: dict, recent_rating
         })
     return rows
 
+
 def _fetch_players_stats_all_pages(team_id: int, season: int, league_id: int, headers: dict) -> list:
     items, page, total_pages = [], 1, 1
     while page <= total_pages and page <= 3:
@@ -635,8 +670,10 @@ def _fetch_players_stats_all_pages(team_id: int, season: int, league_id: int, he
         page += 1
     return items
 
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_squad(team_name: str, league_name: str = "Premier League", seed_offset: int = 0, n_games: int = 5) -> pd.DataFrame:
+    """Fetches squad player stats STRICTLY for current league matches."""
     if API_FOOTBALL_KEY:
         try:
             headers = {"x-apisports-key": API_FOOTBALL_KEY}
@@ -658,6 +695,7 @@ def fetch_squad(team_name: str, league_name: str = "Premier League", seed_offset
                 fallback_xa90 = {"FW": 0.15, "MF": 0.16, "DF": 0.03, "GK": 0.0}
 
                 recent_ratings = fetch_player_recent_ratings(team_id, league_name=league_name, n_games=n_games)
+
                 items = _fetch_players_stats_all_pages(team_id, season, league_id, headers)
                 data_source = f"API-Football stats ({season} {league_name})"
 
@@ -698,6 +736,7 @@ def fetch_squad(team_name: str, league_name: str = "Premier League", seed_offset
     df = _mock_squad(team_name, seed_offset, n_games)
     df["data_source"] = f"Mock ({league_name} - API-Football unavailable)"
     return df
+
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_team_form(team_name: str, league_name: str = "Premier League") -> pd.DataFrame:
@@ -743,67 +782,176 @@ def fetch_team_form(team_name: str, league_name: str = "Premier League") -> pd.D
             pass
     return _mock_form(team_name)
 
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _fetch_api_football_fixture_id(home_team: str, away_team: str, league_name: str) -> Optional[int]:
+    """
+    Finds API-Football's own fixture ID for this matchup. Needed because our
+    fixture list comes from football-data.org, which uses a completely
+    different ID scheme than API-Football — can't just reuse the id we
+    already have.
+    """
+    if not API_FOOTBALL_KEY:
+        return None
+    try:
+        headers = {"x-apisports-key": API_FOOTBALL_KEY}
+        league_id = API_FOOTBALL_LEAGUE_IDS.get(league_name, 39)
+        r = requests.get(
+            f"https://{API_FOOTBALL_HOST}/fixtures",
+            headers=headers, params={"league": league_id, "season": _current_season_year(), "next": 30},
+            timeout=8,
+        )
+        r.raise_for_status()
+        for f in r.json().get("response", []):
+            h, a = f["teams"]["home"]["name"], f["teams"]["away"]["name"]
+            if is_team_match(h, home_team) and is_team_match(a, away_team):
+                return f["fixture"]["id"]
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_api_football_odds(home_team: str, away_team: str, league_name: str = "Premier League") -> Optional[dict]:
+    """
+    API-Football's own /odds endpoint — free fallback consensus source using
+    the SAME key already configured for squads/players, no new signup.
+    Averages across whatever bookmakers API-Football lists for this fixture.
+
+    Per API-Football's own docs: odds typically appear 1-14 days before
+    kickoff and refresh roughly every 3 hours — very far out or very last-
+    minute, this may legitimately return nothing yet, which is not a bug.
+    """
+    if not API_FOOTBALL_KEY:
+        return None
+    fixture_id = _fetch_api_football_fixture_id(home_team, away_team, league_name)
+    if not fixture_id:
+        return None
+    try:
+        headers = {"x-apisports-key": API_FOOTBALL_KEY}
+        r = requests.get(
+            f"https://{API_FOOTBALL_HOST}/odds",
+            headers=headers, params={"fixture": fixture_id}, timeout=8,
+        )
+        r.raise_for_status()
+        response = r.json().get("response", [])
+        if not response:
+            return None
+
+        home_p, draw_p, away_p = [], [], []
+        over_p, under_p, btts_yes_p, btts_no_p = [], [], [], []
+
+        bookmakers = response[0].get("bookmakers", [])
+        for bk in bookmakers:
+            for bet in bk.get("bets", []):
+                name = bet.get("name", "")
+                values = bet.get("values", [])
+                if name == "Match Winner":
+                    for v in values:
+                        if v["value"] == "Home": home_p.append(float(v["odd"]))
+                        elif v["value"] == "Draw": draw_p.append(float(v["odd"]))
+                        elif v["value"] == "Away": away_p.append(float(v["odd"]))
+                elif name in ("Over/Under 2.5 Goals", "Goals Over/Under"):
+                    for v in values:
+                        label = v["value"]
+                        if "Over" in label: over_p.append(float(v["odd"]))
+                        elif "Under" in label: under_p.append(float(v["odd"]))
+                elif name in ("Both Teams Score", "Both Teams To Score"):
+                    for v in values:
+                        if v["value"] == "Yes": btts_yes_p.append(float(v["odd"]))
+                        elif v["value"] == "No": btts_no_p.append(float(v["odd"]))
+
+        if not home_p:
+            return None
+
+        return {
+            "1X2": {
+                "home": round(float(np.mean(home_p)), 2),
+                "draw": round(float(np.mean(draw_p)), 2) if draw_p else None,
+                "away": round(float(np.mean(away_p)), 2) if away_p else None,
+            },
+            "over_2_5": round(float(np.mean(over_p)), 2) if over_p else None,
+            "under_2_5": round(float(np.mean(under_p)), 2) if under_p else None,
+            "btts_yes": round(float(np.mean(btts_yes_p)), 2) if btts_yes_p else None,
+            "btts_no": round(float(np.mean(btts_no_p)), 2) if btts_no_p else None,
+            "source": f"API-Football odds ({len(bookmakers)} bookmakers)",
+        }
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_market_odds(home_team: str, away_team: str, league_name: str = "Premier League") -> dict:
     sport_key = ODDS_API_SPORT_KEYS.get(league_name, "soccer_epl")
-    if not THE_ODDS_API_KEY: 
-        return _mock_odds(home_team, away_team)
-        
-    try:
-        r = requests.get(f"{ODDS_API_BASE}/sports/{sport_key}/odds", params={"apiKey": THE_ODDS_API_KEY, "regions": "uk,eu", "markets": "h2h,totals,btts", "oddsFormat": "decimal"}, timeout=8)
-        r.raise_for_status()
-        events = r.json()
-        for ev in events:
-            if is_team_match(ev["home_team"], home_team) and is_team_match(ev["away_team"], away_team):
-                h2h_prices, ou_prices, btts_prices = {"h": [], "d": [], "a": []}, {"o": [], "u": []}, {"y": [], "n": []}
-                
-                for book in ev["bookmakers"]:
-                    for m in book["markets"]:
-                        if m["key"] == "h2h":
-                            for o in m["outcomes"]:
-                                if is_team_match(o["name"], ev["home_team"]): h2h_prices["h"].append(o["price"])
-                                elif o["name"] == "Draw": h2h_prices["d"].append(o["price"])
-                                else: h2h_prices["a"].append(o["price"])
-                        elif m["key"] == "totals":
-                            for o in m["outcomes"]:
-                                if o.get("point") != 2.5:
-                                    continue
-                                if o["name"] == "Over": ou_prices["o"].append(o["price"])
-                                elif o["name"] == "Under": ou_prices["u"].append(o["price"])
-                        elif m["key"] == "btts":
-                            for o in m["outcomes"]:
-                                if o["name"] == "Yes": btts_prices["y"].append(o["price"])
-                                elif o["name"] == "No": btts_prices["n"].append(o["price"])
+    if THE_ODDS_API_KEY:
+        try:
+            r = requests.get(f"{ODDS_API_BASE}/sports/{sport_key}/odds", params={"apiKey": THE_ODDS_API_KEY, "regions": "uk,eu", "markets": "h2h,totals,btts", "oddsFormat": "decimal"}, timeout=8)
+            r.raise_for_status()
+            events = r.json()
+            for ev in events:
+                if is_team_match(ev["home_team"], home_team) and is_team_match(ev["away_team"], away_team):
+                    h2h_prices, ou_prices, btts_prices = {"h": [], "d": [], "a": []}, {"o": [], "u": []}, {"y": [], "n": []}
+                    
+                    for book in ev["bookmakers"]:
+                        for m in book["markets"]:
+                            if m["key"] == "h2h":
+                                for o in m["outcomes"]:
+                                    if is_team_match(o["name"], ev["home_team"]): h2h_prices["h"].append(o["price"])
+                                    elif o["name"] == "Draw": h2h_prices["d"].append(o["price"])
+                                    else: h2h_prices["a"].append(o["price"])
+                            elif m["key"] == "totals":
+                                # BUGFIX: The Odds API's totals outcomes carry a "point"
+                                # field (the actual line, e.g. 2.5, 1.5, 3.5). Without
+                                # filtering to point==2.5, this was averaging prices from
+                                # DIFFERENT lines together — an "Over 3.5" price blended
+                                # with an "Over 2.5" price produces a meaningless number,
+                                # not a consensus. Only the 2.5 line matches our markets.
+                                for o in m["outcomes"]:
+                                    if o.get("point") != 2.5:
+                                        continue
+                                    if o["name"] == "Over": ou_prices["o"].append(o["price"])
+                                    elif o["name"] == "Under": ou_prices["u"].append(o["price"])
+                            elif m["key"] == "btts":
+                                for o in m["outcomes"]:
+                                    if o["name"] == "Yes": btts_prices["y"].append(o["price"])
+                                    elif o["name"] == "No": btts_prices["n"].append(o["price"])
 
-                if not h2h_prices["h"]: return _mock_odds(home_team, away_team)
-                
-                return {
-                    "1X2": {
-                        "home": round(np.mean(h2h_prices["h"]), 2),
-                        "draw": round(np.mean(h2h_prices["d"]), 2),
-                        "away": round(np.mean(h2h_prices["a"]), 2)
-                    },
-                    "over_2_5": round(np.mean(ou_prices["o"]), 2) if ou_prices["o"] else None,
-                    "under_2_5": round(np.mean(ou_prices["u"]), 2) if ou_prices["u"] else None,
-                    "btts_yes": round(np.mean(btts_prices["y"]), 2) if btts_prices["y"] else None,
-                    "btts_no": round(np.mean(btts_prices["n"]), 2) if btts_prices["n"] else None,
-                    "source": f"Consensus Average ({len(ev['bookmakers'])} Bookies)"
-                }
-    except Exception:
-        pass
-        
+                    if h2h_prices["h"]:
+                        return {
+                            "1X2": {
+                                "home": round(np.mean(h2h_prices["h"]), 2),
+                                "draw": round(np.mean(h2h_prices["d"]), 2),
+                                "away": round(np.mean(h2h_prices["a"]), 2)
+                            },
+                            "over_2_5": round(np.mean(ou_prices["o"]), 2) if ou_prices["o"] else None,
+                            "under_2_5": round(np.mean(ou_prices["u"]), 2) if ou_prices["u"] else None,
+                            "btts_yes": round(np.mean(btts_prices["y"]), 2) if btts_prices["y"] else None,
+                            "btts_no": round(np.mean(btts_prices["n"]), 2) if btts_prices["n"] else None,
+                            "source": f"Consensus Average ({len(ev['bookmakers'])} Bookies)"
+                        }
+        except Exception:
+            pass
+
+    api_football_result = fetch_api_football_odds(home_team, away_team, league_name)
+    if api_football_result:
+        return api_football_result
+
     return _mock_odds(home_team, away_team)
 
 # ====================================================================================
 # 5. QUANTITATIVE MODELING ENGINE
 # ====================================================================================
 def _find_unique_team_match(candidates, target_name: str):
+    """Same uniqueness-safety principle as _match_hist_team_rows, for small
+    lists (standings tables) rather than a DataFrame column."""
     target_norm = normalize_team_name(target_name).casefold()
     exact = [c for c in candidates if normalize_team_name(c).casefold() == target_norm]
     if exact:
         return exact[0]
     hits = [c for c in candidates if is_team_match(c, target_name)]
     return hits[0] if len(hits) == 1 else None
+
 
 def calculate_team_base_lambdas(
     home_team: str, away_team: str, team_stats: pd.DataFrame
@@ -843,7 +991,18 @@ def calculate_team_base_lambdas(
     return (round(base_lam_home, 3), round(base_lam_away, 3), home_info, away_info,
             round(float(league_home_avg), 3), round(float(league_away_avg), 3))
 
+
 def player_impact_score(squad: pd.DataFrame, active_mask: dict) -> Tuple[float, pd.DataFrame]:
+    """
+    BUGFIX: previously took is_facing_promoted/is_promoted_team flags and
+    applied an extra ±5%/12% multiplier here — but the promotion effect is
+    ALREADY fully applied to base_lambda via PROMOTION_ATTACK_DISCOUNT/
+    PROMOTION_DEFENSE_PENALTY in _team_hist_side_stats. Applying it a second
+    time here double-counted the same adjustment (verified: a promoted team
+    was getting discounted in base_lambda AND penalized again in PIV; their
+    opponent got boosted in base_lambda's opponent-defense term AND boosted
+    again here). Removed — promotion effects now apply exactly once.
+    """
     if squad.empty: return 1.0, squad
     squad = squad.copy()
     squad["status"] = squad["player"].map(lambda p: "Active" if active_mask.get(p, True) else "Injured/Out")
@@ -861,7 +1020,20 @@ def player_impact_score(squad: pd.DataFrame, active_mask: dict) -> Tuple[float, 
     piv_multiplier = 0.60 + 0.40 * availability_ratio
     return round(piv_multiplier, 3), squad
 
+
 def team_form_rating_0_100(form_df: pd.DataFrame) -> float:
+    """
+    BUGFIX: form_multiplier/form_mult (a recency-weighted GF/xG-differential
+    signal from fetch_team_form's data) was restored to lambda_final in a
+    previous round to stop it silently being cosmetic-only. But now that
+    fetch_team_recent_xg_and_sos is properly recency-weighted (see above),
+    xg_att_reg_mult/xg_def_reg_mult_opponent measure the same underlying
+    "recent form" signal — better, since it's also opponent- and luck-
+    adjusted. Keeping both would double-count recent form twice from two
+    different sources. form_mult is removed again; this rating stays as a
+    DISPLAY-ONLY summary (labeled as such below), while the actual recent-
+    form adjustment to λ flows through the regression multipliers only.
+    """
     weights = np.array([0.10, 0.15, 0.20, 0.25, 0.30])
     df = form_df.sort_values("matches_ago", ascending=False).reset_index(drop=True)
     if len(df) < 5:
@@ -869,6 +1041,7 @@ def team_form_rating_0_100(form_df: pd.DataFrame) -> float:
     xg_diff = df["xG_for"] - df["xG_against"]
     score = float((xg_diff * weights).sum())
     return round(min(max(50 + score * 25, 0), 100), 1)
+
 
 def weather_modifier(weather: dict) -> float:
     penalty = 1.0
@@ -879,10 +1052,12 @@ def weather_modifier(weather: dict) -> float:
     elif precip > 2: penalty -= 0.03
     return round(max(penalty, 0.80), 3)
 
+
 def rest_modifier(days_rest: int) -> float:
     if days_rest <= 2: return 0.93
     elif days_rest == 3: return 0.97
     return 1.00
+
 
 @dataclass
 class TeamModelInputs:
@@ -900,11 +1075,20 @@ class TeamModelInputs:
 
     @property
     def lambda_final(self) -> float:
+        # form_mult intentionally excluded — see team_form_rating_0_100 docstring.
         raw = self.base_lambda * self.piv_multiplier * self.weather_mult * self.rest_mult * self.xg_att_reg_mult * self.xg_def_reg_mult_opponent * self.press_mult * self.travel_mult
+        # BUGFIX: each new multiplier (regression, press, travel) was clamped
+        # individually, but 7+ multiplicative terms can still compound far past
+        # any single factor's bound (e.g. three factors at +30% each already
+        # compounds to +120%). This is very likely why model odds drifted from
+        # the simpler pre-rewrite version. Cap the COMBINED swing to within 2x
+        # of base_lambda either direction — a joint safety net on top of the
+        # individual ones, not a replacement for them.
         combined_mult = (raw / self.base_lambda) if self.base_lambda > 0 else 1.0
         combined_mult = max(0.5, min(2.0, combined_mult))
         val = self.base_lambda * combined_mult
         return round(max(val, 0.05), 3)
+
 
 def dixon_coles_tau(x: int, y: int, lam_home: float, lam_away: float, rho: float = -0.06) -> float:
     if x == 0 and y == 0: return 1 - lam_home * lam_away * rho
@@ -912,6 +1096,7 @@ def dixon_coles_tau(x: int, y: int, lam_home: float, lam_away: float, rho: float
     elif x == 1 and y == 0: return 1 + lam_away * rho
     elif x == 1 and y == 1: return 1 - rho
     return 1.0
+
 
 def scoreline_matrix(lam_home: float, lam_away: float, max_goals: int = 9, rho: float = -0.06) -> np.ndarray:
     matrix = np.zeros((max_goals + 1, max_goals + 1))
@@ -928,9 +1113,11 @@ def scoreline_matrix(lam_home: float, lam_away: float, max_goals: int = 9, rho: 
 def fair_odds(prob: float) -> float:
     return round(1 / prob, 3) if prob > 1e-6 else float("inf")
 
+
 def apply_margin(probs: dict, target_margin_pct: float) -> dict:
     margin_factor = 1 + (target_margin_pct / 100)
     return {k: round(fair_odds(v) / margin_factor, 2) for k, v in probs.items()}
+
 
 def devig_proportional(home_o: float, draw_o: float, away_o: float) -> Optional[Tuple[float, float, float]]:
     if not all([home_o, draw_o, away_o]) or any(o <= 1.0 for o in [home_o, draw_o, away_o]):
@@ -939,12 +1126,14 @@ def devig_proportional(home_o: float, draw_o: float, away_o: float) -> Optional[
     overround = raw_h + raw_d + raw_a
     return round(raw_h / overround, 4), round(raw_d / overround, 4), round(raw_a / overround, 4)
 
+
 def devig_two_way(odd_a: float, odd_b: float) -> Optional[Tuple[float, float]]:
     if not odd_a or not odd_b or odd_a <= 1.0 or odd_b <= 1.0:
         return None
     raw_a, raw_b = 1 / odd_a, 1 / odd_b
     overround = raw_a + raw_b
     return round(raw_a / overround, 4), round(raw_b / overround, 4)
+
 
 def kelly_stake(model_prob: float, book_odds: float, fraction: float = 0.25) -> float:
     if not book_odds or book_odds <= 1.0 or model_prob <= 0:
@@ -954,6 +1143,7 @@ def kelly_stake(model_prob: float, book_odds: float, fraction: float = 0.25) -> 
     q = 1.0 - p
     f = (b * p - q) / b
     return round(max(0.0, f * fraction * 100), 2)
+
 
 def derive_markets(matrix: np.ndarray) -> dict:
     max_goals = matrix.shape[0] - 1
@@ -1057,18 +1247,25 @@ with st.sidebar.expander("1. xG Regression & Opponent Strength", expanded=False)
     a_true_xgf = a_xgf / a_opp_def if a_opp_def > 0 else a_xgf
     a_true_xga = a_xga / a_opp_att if a_opp_att > 0 else a_xga
 
-    # 1. Calculate raw regressed expected goals
-    h_regressed_xgf = (h_true_xgf * 0.70) + (h_gf * 0.30)
-    h_regressed_xga = (h_true_xga * 0.70) + (h_ga * 0.30)
-    a_regressed_xgf = (a_true_xgf * 0.70) + (a_gf * 0.30)
-    a_regressed_xga = (a_true_xga * 0.70) + (a_ga * 0.30)
+    # BUGFIX (Inverted Regression Math Bug): base_lambda is always built from
+    # ACTUAL GOALS in this app — historical CSV uses FTHG/FTAG directly, and
+    # the standings/mock fallback's "home_xG_for" columns are goals-per-game
+    # (goalsFor/playedGames from football-data.org, or a random proxy in mock)
+    # just labeled "xG" — there is no real-xG code path anywhere in this file.
+    # Dividing by h_xgf instead of h_gf meant a team that got lucky (gf=3.0,
+    # xgf=1.0) produced blended=1.6, then 1.6/xgf=1.6x — an UPWARD boost to a
+    # team that just overperformed its process quality, i.e. the model
+    # amplified luck instead of regressing away from it. Dividing by the
+    # actual recent goals (gf/ga) gives 1.6/3.0=0.53x — correctly discounts
+    # the lucky result back toward true quality. This must always use gf/ga,
+    # never a source-dependent choice, since no path here ever uses real xG.
+    h_att_reg_mult = ((h_true_xgf * 0.70) + (h_gf * 0.30)) / h_gf if h_gf > 0 else 1.0
+    h_def_reg_mult = ((h_true_xga * 0.70) + (h_ga * 0.30)) / h_ga if h_ga > 0 else 1.0
+    a_att_reg_mult = ((a_true_xgf * 0.70) + (a_gf * 0.30)) / a_gf if a_gf > 0 else 1.0
+    a_def_reg_mult = ((a_true_xga * 0.70) + (a_ga * 0.30)) / a_ga if a_ga > 0 else 1.0
 
-    # 2. Divide by the LONG-TERM season averages (Fixes the Unlucky but Terrible paradox)
-    h_att_reg_mult = h_regressed_xgf / auto_home_sos["season_gf"] if auto_home_sos["season_gf"] > 0 else 1.0
-    h_def_reg_mult = h_regressed_xga / auto_home_sos["season_ga"] if auto_home_sos["season_ga"] > 0 else 1.0
-    a_att_reg_mult = a_regressed_xgf / auto_away_sos["season_gf"] if auto_away_sos["season_gf"] > 0 else 1.0
-    a_def_reg_mult = a_regressed_xga / auto_away_sos["season_ga"] if auto_away_sos["season_ga"] > 0 else 1.0
-
+    # Safety clip (±30%): a regression/SoS adjustment should nudge the base
+    # rate, not swamp it, even with a noisy small-sample denominator.
     h_att_reg_mult = float(np.clip(h_att_reg_mult, 0.7, 1.3))
     h_def_reg_mult = float(np.clip(h_def_reg_mult, 0.7, 1.3))
     a_att_reg_mult = float(np.clip(a_att_reg_mult, 0.7, 1.3))
@@ -1091,6 +1288,8 @@ with st.sidebar.expander("2. Tactical Pressing (PPDA & Tilt)", expanded=False):
     
     h_press_mult = (1.0 + 0.05 * (press_edge_h - 1.0)) * (1.0 + tilt_diff/100 * 0.05)
     a_press_mult = (1.0 + 0.05 * (press_edge_a - 1.0)) * (1.0 - tilt_diff/100 * 0.05)
+    # BUGFIX: press_edge is unbounded if a user types a very small PPDA
+    # (e.g. 0.1) — clamp the resulting multiplier to a sane ±15% band.
     h_press_mult = float(np.clip(h_press_mult, 0.85, 1.15))
     a_press_mult = float(np.clip(a_press_mult, 0.85, 1.15))
     st.caption(f"Multiplier: Home **{h_press_mult:.2f}x** | Away **{a_press_mult:.2f}x**")
@@ -1243,6 +1442,10 @@ model_odds_btts = apply_margin({"btts_yes": model_probs["btts_yes"], "btts_no": 
 st.title(f"{home_team} vs {away_team}")
 st.caption(f"{league} · Kickoff {kickoff.strftime('%A %d %B, %H:%M')} · Venue: {city}")
 
+# BUGFIX: this rewrite dropped the tier-warning diagnostics entirely — no
+# indication when a team falls to the neutral 1.0 league-average fallback
+# (the exact silent-failure pattern that hid the mmz4235 URL bug and the
+# Coventry naming-alias gap for weeks). Restored.
 def _tier_warning(team_name: str, info: dict) -> Optional[str]:
     if info["tier"] == "second-tier (promotion-adjusted)":
         return (f"ℹ️ {team_name} has no top-flight matches in the scanned window (likely newly promoted) — "
@@ -1278,6 +1481,8 @@ with c4:
     st.metric("🌡️ Temp", f"{weather['temperature_c']}°C")
     st.metric("💨 Wind", f"{weather['wind_speed_kmh']} km/h")
 
+# BUGFIX: Rating Calculation Breakdown expander was dropped entirely in this
+# rewrite. Restored (using this file's own tier_info/secondary_code names).
 with st.expander("📊 Rating Calculation Breakdown"):
     primary_league_name = league
     secondary_league_name = SECOND_TIER_DISPLAY_NAMES.get(secondary_code, secondary_code or "n/a")
