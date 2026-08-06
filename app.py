@@ -51,7 +51,6 @@ LEAGUES = {
     "Ligue 1": "FL1",
 }
 
-# API-Football Competition IDs for filtering stats STRICTLY to League matches
 API_FOOTBALL_LEAGUE_IDS = {
     "Premier League": 39,
     "La Liga": 140,
@@ -60,7 +59,6 @@ API_FOOTBALL_LEAGUE_IDS = {
     "Ligue 1": 61,
 }
 
-# BUGFIX: Free plans do not have access to this season, try from 2022 to 2024.
 API_FOOTBALL_FREE_TIER_MAX_SEASON = 2024
 
 HIST_LEAGUE_MAP = {
@@ -151,7 +149,6 @@ HIST_TEAM_ALIASES = {
 }
 
 def normalize_team_name(name: str) -> str:
-    """Strips suffixes/prefixes and maps name variants to a single canonical key."""
     if not name:
         return ""
     n = name.strip()
@@ -171,7 +168,6 @@ def normalize_team_name(name: str) -> str:
 
 
 def api_search_name(name: str) -> str:
-    """Strips suffixes/prefixes, with no alias remapping, for API-Football searches."""
     if not name:
         return ""
     n = name.strip()
@@ -184,7 +180,6 @@ def api_search_name(name: str) -> str:
     return n
 
 def is_team_match(name1: str, name2: str) -> bool:
-    """Robust fuzzy/canonical match checking between two team name strings."""
     if not name1 or not name2:
         return False
     norm1 = normalize_team_name(name1).casefold()
@@ -416,7 +411,6 @@ def _mock_fixtures(league: str) -> pd.DataFrame:
         })
     return pd.DataFrame(fixtures)
 
-
 def _mock_season_stats(league: str) -> pd.DataFrame:
     random.seed(hash(league) % 2000)
     teams = LEAGUE_TEAM_POOLS.get(league, LEAGUE_TEAM_POOLS["Premier League"])
@@ -430,7 +424,6 @@ def _mock_season_stats(league: str) -> pd.DataFrame:
             "away_xG_against": round(random.uniform(0.9, 1.8), 2),
         })
     return pd.DataFrame(data)
-
 
 def _mock_squad(team: str, seed_offset: int = 0, n_games: int = 5) -> pd.DataFrame:
     random.seed((hash(team) + seed_offset) % 10000)
@@ -452,7 +445,6 @@ def _mock_squad(team: str, seed_offset: int = 0, n_games: int = 5) -> pd.DataFra
         })
     return pd.DataFrame(rows)
 
-
 def _mock_form(team: str) -> pd.DataFrame:
     random.seed(hash(team) % 5000)
     rows = []
@@ -465,7 +457,6 @@ def _mock_form(team: str) -> pd.DataFrame:
             "xG_against": round(max(0.2, np.random.normal(1.1, 0.3)), 2),
         })
     return pd.DataFrame(rows)
-
 
 def _mock_odds(home: str, away: str) -> dict:
     random.seed(hash(home + away) % 9999)
@@ -512,7 +503,6 @@ def fetch_weather(lat: float, lon: float, kickoff: dt.datetime) -> dict:
     except Exception:
         return {"temperature_c": 14.5, "precipitation_mm": 0.0, "wind_speed_kmh": 12.0, "source": "Mock Weather"}
 
-
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_fixtures(league_name: str) -> pd.DataFrame:
     league_code = LEAGUES.get(league_name)
@@ -531,7 +521,6 @@ def fetch_fixtures(league_name: str) -> pd.DataFrame:
         except Exception:
             pass
     return _mock_fixtures(league_name)
-
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_team_season_stats(league_name: str) -> pd.DataFrame:
@@ -568,7 +557,6 @@ def fetch_team_season_stats(league_name: str) -> pd.DataFrame:
         except Exception:
             pass
     return _mock_season_stats(league_name)
-
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_player_recent_ratings(team_id: int, league_name: str = "Premier League", n_games: int = 5) -> dict:
@@ -612,9 +600,7 @@ def fetch_player_recent_ratings(team_id: int, league_name: str = "Premier League
     except Exception:
         return {}
 
-
-def _parse_players_stats_page(response_items: list, pos_map: dict, recent_ratings: dict,
-                               fallback_xg90: dict, fallback_xa90: dict) -> list:
+def _parse_players_stats_page(response_items: list, pos_map: dict, recent_ratings: dict, fallback_xg90: dict, fallback_xa90: dict) -> list:
     rows = []
     for p in response_items:
         info = p.get("player", {})
@@ -655,7 +641,6 @@ def _parse_players_stats_page(response_items: list, pos_map: dict, recent_rating
         })
     return rows
 
-
 def _fetch_players_stats_all_pages(team_id: int, season: int, league_id: int, headers: dict) -> Tuple[list, bool]:
     items, page, total_pages = [], 1, 1
     while page <= total_pages and page <= 3:
@@ -674,10 +659,8 @@ def _fetch_players_stats_all_pages(team_id: int, season: int, league_id: int, he
         page += 1
     return items, False
 
-
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_squad(team_name: str, league_name: str = "Premier League", seed_offset: int = 0, n_games: int = 5) -> pd.DataFrame:
-    """Fetches squad player stats STRICTLY for current league matches."""
     if API_FOOTBALL_KEY:
         try:
             headers = {"x-apisports-key": API_FOOTBALL_KEY}
@@ -745,7 +728,6 @@ def fetch_squad(team_name: str, league_name: str = "Premier League", seed_offset
     df["data_source"] = f"Mock ({league_name} - API-Football unavailable)"
     return df
 
-
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_team_form(team_name: str, league_name: str = "Premier League") -> pd.DataFrame:
     league_code = LEAGUES.get(league_name)
@@ -790,8 +772,6 @@ def fetch_team_form(team_name: str, league_name: str = "Premier League") -> pd.D
             pass
     return _mock_form(team_name)
 
-
-
 @st.cache_data(ttl=1800, show_spinner=False)
 def _fetch_api_football_fixture_id(home_team: str, away_team: str, league_name: str) -> Tuple[Optional[int], str]:
     if not API_FOOTBALL_KEY:
@@ -818,7 +798,6 @@ def _fetch_api_football_fixture_id(home_team: str, away_team: str, league_name: 
         return None, f"HTTP {code} from /fixtures" + (" (likely daily quota exhausted)" if code in (429, 401, 403) else "")
     except Exception as e:
         return None, f"/fixtures request failed: {type(e).__name__}"
-
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_api_football_odds(home_team: str, away_team: str, league_name: str = "Premier League") -> Tuple[Optional[dict], str]:
@@ -942,7 +921,7 @@ def fetch_market_odds(home_team: str, away_team: str, league_name: str = "Premie
             except requests.exceptions.HTTPError as e:
                 code = e.response.status_code if e.response is not None else "?"
                 if code == 422 and market_param != "h2h":
-                    continue  # Auto-retry with simpler moneyline markets
+                    continue
                 reasons.append(f"The Odds API: HTTP {code}" + (" (quota/auth/invalid param)" if code in (401, 429, 422) else ""))
                 break
             except Exception as e:
@@ -970,7 +949,6 @@ def _find_unique_team_match(candidates, target_name: str):
         return exact[0]
     hits = [c for c in candidates if is_team_match(c, target_name)]
     return hits[0] if len(hits) == 1 else None
-
 
 def calculate_team_base_lambdas(
     home_team: str, away_team: str, team_stats: pd.DataFrame
@@ -1009,171 +987,6 @@ def calculate_team_base_lambdas(
     
     return (round(base_lam_home, 3), round(base_lam_away, 3), home_info, away_info,
             round(float(league_home_avg), 3), round(float(league_away_avg), 3))
-
-def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matches: int = 5) -> dict:
-    default_res = {"gf": 1.5, "xgf": 1.5, "ga": 1.2, "xga": 1.2, "opp_def": 1.00, "opp_att": 1.00, "season_gf": 1.5, "season_ga": 1.5}
-    if hist_df.empty: return default_res
-
-    league_h_g = max(hist_df['FTHG'].mean(), 1.0)
-    league_a_g = max(hist_df['FTAG'].mean(), 1.0)
-
-    home_all = _match_hist_team_rows(hist_df, 'HomeTeam', team_name).head(38)
-    away_all = _match_hist_team_rows(hist_df, 'AwayTeam', team_name).head(38)
-    
-    gf_all, ga_all = [], []
-    if not home_all.empty:
-        gf_all.extend(home_all['FTHG'].tolist())
-        ga_all.extend(home_all['FTAG'].tolist())
-    if not away_all.empty:
-        gf_all.extend(away_all['FTAG'].tolist())
-        ga_all.extend(away_all['FTHG'].tolist())
-        
-    season_gf = round(float(np.mean(gf_all)), 2) if gf_all else league_h_g
-    season_ga = round(float(np.mean(ga_all)), 2) if ga_all else league_a_g
-
-    home_m = _match_hist_team_rows(hist_df, 'HomeTeam', team_name)
-    away_m = _match_hist_team_rows(hist_df, 'AwayTeam', team_name)
-    combined_matches = pd.concat([home_m, away_m]).sort_values('Date', ascending=False).head(n_matches)
-    
-    if combined_matches.empty: 
-        default_res["season_gf"] = season_gf
-        default_res["season_ga"] = season_ga
-        return default_res
-
-    gf_list, ga_list, xgf_list, xga_list, opp_def_list, opp_att_list = [], [], [], [], [], []
-
-    for _, row in combined_matches.iterrows():
-        is_home = is_team_match(str(row['HomeTeam']), team_name)
-        opp_name = row['AwayTeam'] if is_home else row['HomeTeam']
-
-        gf = row['FTHG'] if is_home else row['FTAG']
-        ga = row['FTAG'] if is_home else row['FTHG']
-        gf_list.append(gf)
-        ga_list.append(ga)
-
-        hs = row['HS'] if not pd.isna(row.get('HS')) else 10.0
-        as_ = row['AS'] if not pd.isna(row.get('AS')) else 10.0
-        hst = row['HST'] if not pd.isna(row.get('HST')) else 3.5
-        ast = row['AST'] if not pd.isna(row.get('AST')) else 3.5
-
-        xg_home = 0.32 * hst + 0.03 * max(0, hs - hst)
-        xg_away = 0.32 * ast + 0.03 * max(0, as_ - ast)
-
-        xgf_list.append(xg_home if is_home else xg_away)
-        xga_list.append(xg_away if is_home else xg_home)
-
-        opp_home_rows = _match_hist_team_rows(hist_df, 'HomeTeam', opp_name).head(38)
-        opp_away_rows = _match_hist_team_rows(hist_df, 'AwayTeam', opp_name).head(38)
-        
-        opp_gf_h = opp_home_rows['FTHG'].mean() if not opp_home_rows.empty else league_h_g
-        opp_ga_h = opp_home_rows['FTAG'].mean() if not opp_home_rows.empty else league_a_g
-        opp_gf_a = opp_away_rows['FTAG'].mean() if not opp_away_rows.empty else league_a_g
-        opp_ga_a = opp_away_rows['FTHG'].mean() if not opp_away_rows.empty else league_h_g
-
-        opp_att = ((opp_gf_h + opp_gf_a) / 2.0) / ((league_h_g + league_a_g) / 2.0)
-        opp_def = ((opp_ga_h + opp_ga_a) / 2.0) / ((league_h_g + league_a_g) / 2.0)
-
-        opp_att_list.append(opp_att)
-        opp_def_list.append(opp_def)
-
-    weights = np.array([0.30, 0.25, 0.20, 0.15, 0.10])
-    if len(gf_list) < 5:
-        weights = weights[:len(gf_list)] / weights[:len(gf_list)].sum()
-
-    return {
-        "gf": round(float(np.average(gf_list, weights=weights)), 2),
-        "xgf": round(float(np.average(xgf_list, weights=weights)), 2),
-        "ga": round(float(np.average(ga_list, weights=weights)), 2),
-        "xga": round(float(np.average(xga_list, weights=weights)), 2),
-        "opp_def": round(float(np.average(opp_def_list, weights=weights)), 2),
-        "opp_att": round(float(np.average(opp_att_list, weights=weights)), 2),
-        "season_gf": season_gf,
-        "season_ga": season_ga
-    }
-
-# ====================================================================================
-# 3. MOCK DATA GENERATORS (DEMO FALLBACKS)
-# ====================================================================================
-def _mock_fixtures(league: str) -> pd.DataFrame:
-    random.seed(hash(league) % 1000)
-    teams = LEAGUE_TEAM_POOLS.get(league, LEAGUE_TEAM_POOLS["Premier League"]).copy()
-    fixtures = []
-    base_date = dt.datetime.now() + dt.timedelta(days=2)
-    random.shuffle(teams)
-    for i in range(0, len(teams) - 1, 2):
-        fixtures.append({
-            "fixture_id": f"{league[:2].upper()}{i}",
-            "home_team": teams[i],
-            "away_team": teams[i + 1],
-            "kickoff": (base_date + dt.timedelta(hours=3 * i)).replace(minute=0, second=0, microsecond=0),
-        })
-    return pd.DataFrame(fixtures)
-
-def _mock_season_stats(league: str) -> pd.DataFrame:
-    random.seed(hash(league) % 2000)
-    teams = LEAGUE_TEAM_POOLS.get(league, LEAGUE_TEAM_POOLS["Premier League"])
-    data = []
-    for t in teams:
-        data.append({
-            "team": t,
-            "home_xG_for": round(random.uniform(1.3, 2.3), 2),
-            "home_xG_against": round(random.uniform(0.7, 1.5), 2),
-            "away_xG_for": round(random.uniform(1.0, 1.9), 2),
-            "away_xG_against": round(random.uniform(0.9, 1.8), 2),
-        })
-    return pd.DataFrame(data)
-
-def _mock_squad(team: str, seed_offset: int = 0, n_games: int = 5) -> pd.DataFrame:
-    random.seed((hash(team) + seed_offset) % 10000)
-    positions = ["GK", "DF", "DF", "DF", "DF", "MF", "MF", "MF", "FW", "FW", "FW"]
-    names_pool = ["Silva", "Rodrigues", "Kovac", "Muller", "Dubois", "Novak", "Andersen", "Fernandez", "Costa", "Brandt", "Diaz"]
-    rows = []
-    for i, pos in enumerate(positions):
-        name = f"{random.choice(names_pool)} {chr(65 + i)}"
-        minutes = random.randint(600, 2500)
-        xg90 = round(max(0, np.random.normal(0.38 if pos == "FW" else 0.12 if pos == "MF" else 0.02, 0.10)), 3)
-        xa90 = round(max(0, np.random.normal(0.22 if pos in ("FW", "MF") else 0.03, 0.08)), 3)
-        games_rated = min(n_games, max(0, n_games - random.choice([0, 0, 0, 1, 2, n_games])))
-        rating = round(np.random.normal(7.0, 0.5), 2) if games_rated > 0 else 6.8
-        key_passes90 = round(max(0, np.random.normal(1.5 if pos == "MF" else 0.6, 0.5)), 2)
-        rows.append({
-            "player": name, "position": pos, "minutes": minutes,
-            "xG90": xg90, "xA90": xa90, "key_passes90": key_passes90,
-            "avg_rating": rating, "games_rated": games_rated, "status": "Active",
-        })
-    return pd.DataFrame(rows)
-
-def _mock_form(team: str) -> pd.DataFrame:
-    random.seed(hash(team) % 5000)
-    rows = []
-    for m in range(5, 0, -1):
-        rows.append({
-            "matches_ago": m,
-            "goals_for": np.random.poisson(1.5),
-            "goals_against": np.random.poisson(1.1),
-            "xG_for": round(max(0.2, np.random.normal(1.5, 0.4)), 2),
-            "xG_against": round(max(0.2, np.random.normal(1.1, 0.3)), 2),
-        })
-    return pd.DataFrame(rows)
-
-def _mock_odds(home: str, away: str) -> dict:
-    random.seed(hash(home + away) % 9999)
-    home_p = random.uniform(0.35, 0.55)
-    draw_p = random.uniform(0.22, 0.28)
-    away_p = 1.0 - home_p - draw_p
-    margin = 1.055
-    return {
-        "1X2": {
-            "home": round(1 / (home_p * margin), 2),
-            "draw": round(1 / (draw_p * margin), 2),
-            "away": round(1 / (away_p * margin), 2),
-        },
-        "over_2_5": round(1 / (0.52 * margin), 2),
-        "under_2_5": round(1 / (0.48 * margin), 2),
-        "btts_yes": round(1 / (0.53 * margin), 2),
-        "btts_no": round(1 / (0.47 * margin), 2),
-        "source": "Mock Data Engine"
-    }
 
 def player_impact_score(squad: pd.DataFrame, active_mask: dict) -> Tuple[float, pd.DataFrame]:
     if squad.empty: return 1.0, squad
@@ -1231,12 +1044,22 @@ class TeamModelInputs:
     squad_table: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     @property
-    def lambda_final(self) -> float:
-        raw = self.base_lambda * self.piv_multiplier * self.weather_mult * self.rest_mult * self.xg_att_reg_mult * self.xg_def_reg_mult_opponent * self.press_mult * self.travel_mult
-        combined_mult = (raw / self.base_lambda) if self.base_lambda > 0 else 1.0
-        combined_mult = max(0.5, min(2.0, combined_mult))
-        val = self.base_lambda * combined_mult
-        return round(max(val, 0.05), 3)
+    def combined_multiplier(self) -> float:
+        raw = self.piv_multiplier * self.weather_mult * self.rest_mult * self.xg_att_reg_mult * self.xg_def_reg_mult_opponent * self.press_mult * self.travel_mult
+        return max(0.5, min(2.0, raw))
+
+    @property
+    def lambda_1x2(self) -> float:
+        # Full multiplier for 1X2 devigging (picks up accurate match winner probabilities)
+        return round(max(self.base_lambda * self.combined_multiplier, 0.05), 3)
+
+    @property
+    def lambda_totals(self) -> float:
+        # Dampens the combined multiplier strictly for over/under to prevent artificial goal inflation
+        gamma = 0.50
+        dampened_mult = 1.0 + gamma * (self.combined_multiplier - 1.0)
+        return round(max(self.base_lambda * dampened_mult, 0.05), 3)
+
 
 def dixon_coles_tau(x: int, y: int, lam_home: float, lam_away: float, rho: float = -0.06) -> float:
     if x == 0 and y == 0: return 1 - lam_home * lam_away * rho
@@ -1558,9 +1381,25 @@ away_model = TeamModelInputs(
     press_mult=a_press_mult, travel_mult=away_travel_mult, squad_table=away_squad,
 )
 
-lam_home, lam_away = home_model.lambda_final, away_model.lambda_final
-matrix = scoreline_matrix(lam_home, lam_away, max_goals=9, rho=adjusted_rho)
-model_probs = derive_markets(matrix)
+lam_home_1x2, lam_away_1x2 = home_model.lambda_1x2, away_model.lambda_1x2
+lam_home_tot, lam_away_tot = home_model.lambda_totals, away_model.lambda_totals
+
+matrix_1x2 = scoreline_matrix(lam_home_1x2, lam_away_1x2, max_goals=9, rho=adjusted_rho)
+matrix_tot = scoreline_matrix(lam_home_tot, lam_away_tot, max_goals=9, rho=adjusted_rho)
+
+probs_1x2 = derive_markets(matrix_1x2)
+probs_tot = derive_markets(matrix_tot)
+
+model_probs = {
+    "1X2": probs_1x2["1X2"],
+    "over_2_5": probs_tot["over_2_5"],
+    "under_2_5": probs_tot["under_2_5"],
+    "btts_yes": probs_tot["btts_yes"],
+    "btts_no": probs_tot["btts_no"],
+    "ah_home_-0.5": probs_1x2["ah_home_-0.5"],
+    "ah_away_+0.5": probs_1x2["ah_away_+0.5"],
+}
+
 market_odds = fetch_market_odds(home_team, away_team, league)
 
 model_odds_1x2 = apply_margin(model_probs["1X2"], target_margin)
@@ -1595,15 +1434,17 @@ if "historical CSV" in lambda_source:
 
 c1, c2, c3, c4 = st.columns(4)
 with c1:
-    st.metric("λ Home (Final xG)", lam_home)
-    st.caption(f"Base {base_lam_home} → PIV×{home_piv_mult:.2f} · Reg×{h_att_reg_mult:.2f} (Att) / {a_def_reg_mult:.2f} (Opp Def) · Press×{h_press_mult:.2f}")
+    st.metric("λ Home (1X2 | Totals)", f"{lam_home_1x2} | {lam_home_tot}")
+    damp_h = 1.0 + 0.50 * (home_model.combined_multiplier - 1.0)
+    st.caption(f"Base {base_lam_home} → Combined Multiplier: **{home_model.combined_multiplier:.2f}x** (Dampened to **{damp_h:.2f}x** for Totals)")
 with c2:
-    st.metric("λ Away (Final xG)", lam_away)
-    st.caption(f"Base {base_lam_away} → PIV×{away_piv_mult:.2f} · Reg×{a_att_reg_mult:.2f} (Att) / {h_def_reg_mult:.2f} (Opp Def) · Trvl×{away_travel_mult:.2f}")
+    st.metric("λ Away (1X2 | Totals)", f"{lam_away_1x2} | {lam_away_tot}")
+    damp_a = 1.0 + 0.50 * (away_model.combined_multiplier - 1.0)
+    st.caption(f"Base {base_lam_away} → Combined Multiplier: **{away_model.combined_multiplier:.2f}x** (Dampened to **{damp_a:.2f}x** for Totals)")
 with c3:
     st.metric(f"{home_team} Form", f"{home_model.form_rating}/100")
     st.metric(f"{away_team} Form", f"{away_model.form_rating}/100")
-    st.caption("Informational only — recent-form effect on λ flows through the Reg× multipliers above, not this metric.")
+    st.caption("Informational only — recent-form effect on λ flows through the Reg× multipliers.")
 with c4:
     st.metric("🌡️ Temp", f"{weather['temperature_c']}°C")
     st.metric("💨 Wind", f"{weather['wind_speed_kmh']} km/h")
@@ -1626,12 +1467,6 @@ with st.expander("📊 Rating Calculation Breakdown"):
 
     st.markdown("**Rating Summary Table**")
     st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
-    st.caption(
-        f"Base λ formula: Home = {league_home_avg_used} × α_home × β_away ≈ {base_lam_home} · "
-        f"Away = {league_away_avg_used} × α_away × β_home ≈ {base_lam_away}. "
-        f"Final λ additionally applies PIV, form, weather, rest, xG-regression, press, and travel multipliers "
-        f"(see captions above the heatmap)."
-    )
 
 st.divider()
 
@@ -1702,11 +1537,11 @@ if market_odds.get("source"): st.caption(f"Odds Source: {market_odds['source']}"
 
 st.divider()
 
-st.subheader("🔥 Scoreline Probability Matrix Heatmap")
-heat_labels = list(range(matrix.shape[0]))
+st.subheader("🔥 Scoreline Probability Matrix Heatmap (1X2 Base)")
+heat_labels = list(range(matrix_1x2.shape[0]))
 fig = go.Figure(data=go.Heatmap(
-    z=matrix * 100, x=[f"{away_team} {g}" for g in heat_labels], y=[f"{home_team} {g}" for g in heat_labels],
-    colorscale="YlOrRd", text=np.round(matrix * 100, 1), texttemplate="%{text}%", textfont={"size": 11}, hoverongaps=False
+    z=matrix_1x2 * 100, x=[f"{away_team} {g}" for g in heat_labels], y=[f"{home_team} {g}" for g in heat_labels],
+    colorscale="YlOrRd", text=np.round(matrix_1x2 * 100, 1), texttemplate="%{text}%", textfont={"size": 11}, hoverongaps=False
 ))
 fig.update_layout(
     title=f"Scoreline Probability Distribution (%) — Adjusted Dixon-Coles ρ: {adjusted_rho:.4f}",
