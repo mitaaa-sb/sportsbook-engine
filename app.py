@@ -296,7 +296,6 @@ def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matche
     league_h_g = max(hist_df['FTHG'].mean(), 1.0)
     league_a_g = max(hist_df['FTAG'].mean(), 1.0)
 
-    # 1. LONG-TERM SEASON AVERAGES (Calculated in Proxy-xG units for consistent scale)
     home_all = _match_hist_team_rows(hist_df, 'HomeTeam', team_name).head(38)
     away_all = _match_hist_team_rows(hist_df, 'AwayTeam', team_name).head(38)
     
@@ -315,7 +314,6 @@ def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matche
     season_xgf = round(float(np.mean(xgf_all)), 2) if xgf_all else 1.5
     season_xga = round(float(np.mean(xga_all)), 2) if xga_all else 1.2
 
-    # 2. RECENT FORM STATS WITH VENUE-SPECIFIC OPPONENT STRENGTH
     home_m = _match_hist_team_rows(hist_df, 'HomeTeam', team_name)
     away_m = _match_hist_team_rows(hist_df, 'AwayTeam', team_name)
     combined_matches = pd.concat([home_m, away_m]).sort_values('Date', ascending=False).head(n_matches)
@@ -345,7 +343,6 @@ def fetch_team_recent_xg_and_sos(team_name: str, hist_df: pd.DataFrame, n_matche
         xgf_list.append(xg_home if is_home else xg_away)
         xga_list.append(xg_away if is_home else xg_home)
 
-        # Match venue-specific opponent performance
         if is_home:
             opp_rows = _match_hist_team_rows(hist_df, 'AwayTeam', opp_name).head(38)
             opp_att = (opp_rows['FTAG'].mean() / league_a_g) if not opp_rows.empty else 1.0
@@ -1077,14 +1074,18 @@ def devig_two_way(odd_a: float, odd_b: float) -> Optional[Tuple[float, float]]:
     overround = raw_a + raw_b
     return round(raw_a / overround, 4), round(raw_b / overround, 4)
 
-def kelly_stake(model_prob: float, book_odds: float, fraction: float = 0.25) -> float:
+def kelly_stake(model_prob: float, book_odds: float, fraction: float = 0.125, max_cap: float = 0.025) -> float:
     if not book_odds or book_odds <= 1.0 or model_prob <= 0:
         return 0.0
     b = book_odds - 1.0
     p = model_prob
     q = 1.0 - p
     f = (b * p - q) / b
-    return round(max(0.0, f * fraction * 100), 2)
+    
+    raw_stake = max(0.0, f * fraction)
+    capped_stake = min(raw_stake, max_cap)
+    
+    return round(capped_stake * 100, 2)
 
 def derive_markets(matrix: np.ndarray) -> dict:
     max_goals = matrix.shape[0] - 1
@@ -1138,9 +1139,16 @@ secondary_code = HIST_SECONDARY_LEAGUE_MAP.get(hist_code)
 secondary_hist_df = fetch_historical_league_data(secondary_code) if secondary_code else pd.DataFrame()
 
 st.sidebar.divider()
-st.sidebar.subheader("Trading Parameters")
+st.sidebar.subheader("Trading Parameters & Variance Limits")
 target_margin = st.sidebar.slider("Target Model Margin (%)", 2.0, 8.0, 5.0, 0.5)
-kelly_fraction = st.sidebar.slider("Kelly Fractional Sizing", 0.1, 1.0, 0.25, 0.05, help="0.25 = Quarter Kelly")
+
+# Added UI controls for the risk management and confidence filters
+kelly_fraction = st.sidebar.slider("Kelly Fractional Sizing", 0.05, 1.0, 0.125, 0.025, help="0.125 = Eighth Kelly (Recommended)")
+max_stake_cap = st.sidebar.slider("Max Stake Cap (% Bankroll)", 1.0, 10.0, 2.5, 0.5) / 100.0
+
+st.sidebar.markdown("**Value Safety Filters**")
+max_odds_cap = st.sidebar.number_input("Max Bookmaker Odds (Cap)", value=2.20, step=0.10)
+min_model_conf = st.sidebar.number_input("Min Model Confidence (Fair Odds)", value=1.70, step=0.10)
 
 st.sidebar.subheader("Rest Differential (Days Rest)")
 c_r1, c_r2 = st.sidebar.columns(2)
@@ -1471,7 +1479,7 @@ devig_btts = devig_two_way(market_odds.get("btts_yes"), market_odds.get("btts_no
 
 def build_trade_row(market_label, model_prob, model_odd, book_odd, fair_mkt_prob):
     if not book_odd or book_odd <= 1.0:
-        return {"Market": market_label, "Model Odds": model_odd, "Consensus Odds": "N/A", "Edge (pp)": 0, "Kelly Stake": "0.0%", "Signal": "N/A"}
+        return {"Market": market_label, "Model Odds": model_odd, "Consensus Odds": "N/A", "Edge (pp)": 0, "Kelly Stake %": "0.0%", "Signal": "N/A"}
 
     devigged = True
     if fair_mkt_prob is None:
@@ -1479,10 +1487,24 @@ def build_trade_row(market_label, model_prob, model_odd, book_odd, fair_mkt_prob
         devigged = False
 
     edge_pp = round((model_prob - fair_mkt_prob) * 100, 2)
-    stake_pct = kelly_stake(model_prob, book_odd, kelly_fraction)
+    
+    # Passing the new UI filters into the sizing function
+    stake_pct = kelly_stake(model_prob, book_odd, kelly_fraction, max_stake_cap)
 
-    if not devigged: signal = "⚠️ NO DEVIG"
-    else: signal = "🟢 VALUE" if edge_pp >= 2.0 and stake_pct > 0 else ("🔴 OVERPRICED" if edge_pp <= -2.0 else "⚪ FAIR")
+    if not devigged: 
+        signal = "⚠️ NO DEVIG"
+    else: 
+        if edge_pp >= 2.0 and stake_pct > 0:
+            if book_odd > max_odds_cap:
+                signal = "🟡 EDGE (Odds > Cap)"
+            elif model_odd >= min_model_conf:
+                signal = "🟡 EDGE (Model Conf < Cap)"
+            else:
+                signal = "🟢 VALUE (PLAY)"
+        elif edge_pp <= -2.0:
+            signal = "🔴 OVERPRICED"
+        else:
+            signal = "⚪ FAIR"
 
     return {
         "Market": market_label,
