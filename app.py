@@ -61,22 +61,14 @@ HIST_LEAGUE_MAP = {
     "Ligue 1": "F1",
 }
 
-# Second-tier equivalent for each top-flight league, on football-data.co.uk's
-# own code scheme. Used ONLY as a fallback for a team with zero matches in
-# the top-flight window — i.e. a newly promoted club (e.g. Coventry City
-# going up to the Premier League for 2026/27 with no E0 history yet). This is
-# not a naming-mismatch fix; it's a genuinely different data source.
 HIST_SECONDARY_LEAGUE_MAP = {
-    "E0": "E1",    # Premier League <- Championship
-    "SP1": "SP2",  # La Liga <- Segunda División
-    "I1": "I2",    # Serie A <- Serie B
-    "D1": "D2",    # Bundesliga <- 2. Bundesliga
-    "F1": "F2",    # Ligue 1 <- Ligue 2
+    "E0": "E1",    
+    "SP1": "SP2",  
+    "I1": "I2",    
+    "D1": "D2",    
+    "F1": "F2",    
 }
 
-# Display names for the second tier, used only in the Rating Calculation
-# Breakdown UI so the transparency table reads "Championship Baseline"
-# rather than the raw football-data.co.uk code "E1 Baseline".
 SECOND_TIER_DISPLAY_NAMES = {
     "E1": "Championship",
     "SP2": "Segunda División",
@@ -85,15 +77,6 @@ SECOND_TIER_DISPLAY_NAMES = {
     "F2": "Ligue 2",
 }
 
-# Heuristic adjustment for a newly promoted club: they tend to score less
-# and concede more once they step up a division compared to their previous
-# tier's numbers. NOT fitted to this dataset — a chosen prior, not a
-# calibrated estimate. Switched (by request) from a milder 0.85/1.15 to this
-# harsher 0.55/1.48 pair, matching the reference document's values. Both
-# sets are equally unsourced; this one simply applies a bigger discount/
-# penalty. If you want this properly calibrated rather than chosen, it
-# should be backtested against actual promoted teams' first-season
-# top-flight numbers vs. their prior second-tier numbers.
 PROMOTION_ATTACK_DISCOUNT = 0.55
 PROMOTION_DEFENSE_PENALTY = 1.48
 
@@ -128,13 +111,6 @@ def _current_season_year() -> int:
 
 
 def _recent_hist_season_codes(n: int = 3) -> list:
-    """
-    Football-Data.co.uk season codes like '2324' for the 2023/24 season.
-    Previously hardcoded to ["2324", "2425", "2526"], which will silently go
-    stale every year (never picks up the new season, keeps re-requesting an
-    ever-more-outdated 3-season window). This computes the trailing n
-    seasons ending at the CURRENT season, so it stays correct automatically.
-    """
     start_year = _current_season_year()
     return [f"{str(y)[-2:]}{str(y + 1)[-2:]}" for y in range(start_year - n + 1, start_year + 1)]
 
@@ -144,18 +120,6 @@ def _recent_hist_season_codes(n: int = 3) -> list:
 # ====================================================================================
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_historical_league_data(league_code: str = "E0") -> pd.DataFrame:
-    """
-    Downloads multi-season match data, goals, and closing odds directly 
-    from Football-Data.co.uk CSVs without requiring an API key.
-
-    BUGFIX: the URL previously pointed at "mmz4235", which is not a real path
-    on football-data.co.uk (verified against their live site) — every request
-    404'd, was swallowed by the except/continue below, and this function
-    always silently returned an empty DataFrame. That means the multi-season
-    historical engine has never actually run; the app has been falling
-    through to the single-season standings fallback the whole time with no
-    indication anything failed. The correct path segment is "mmz4281".
-    """
     seasons = _recent_hist_season_codes(3)
     dfs = []
     
@@ -178,10 +142,6 @@ def fetch_historical_league_data(league_code: str = "E0") -> pd.DataFrame:
     return pd.DataFrame()
 
 
-# Known football-data.co.uk short-name quirks that don't match the official
-# names returned by football-data.org / API-Football (e.g. "Manchester City
-# FC" vs "Man City", "Atletico Madrid" vs "Ath Madrid"). Extend this table if
-# other mismatches surface — particularly for leagues/seasons not checked here.
 HIST_TEAM_ALIASES = {
     "Manchester City": "Man City",
     "Manchester United": "Man United",
@@ -224,8 +184,6 @@ HIST_TEAM_ALIASES = {
 
 
 def _normalize_hist_team_name(name: str) -> str:
-    """Strips common club suffixes and applies known aliases so official
-    names compare cleanly against football-data.co.uk's short-form names."""
     n = (name or "").strip()
     for suffix in (" FC", " CF", " AFC", " Football Club"):
         if n.endswith(suffix):
@@ -235,31 +193,6 @@ def _normalize_hist_team_name(name: str) -> str:
 
 
 def _match_hist_team_rows(hist_df: pd.DataFrame, column: str, team_name: str) -> pd.DataFrame:
-    """
-    Finds this team's rows in the historical CSV.
-
-    BUGFIX: the previous approach matched on `team_name[:5]` as a raw
-    substring, which had two failure modes: (1) silently matched NOTHING for
-    teams whose official name doesn't share a prefix with football-data.co.uk's
-    short form — e.g. "Manchester City FC"[:5] = "Manch", which is not even a
-    substring of "Man City" — quietly falling back to a generic 1.0
-    average-team rating for exactly the sort of big favourite this tool needs
-    to price well; and (2) silently corrupted results by merging DIFFERENT
-    clubs together when they share a 5-char prefix — e.g. "Real Madrid",
-    "Real Sociedad", and "Real Betis" all start with "Real ".
-
-    This now: (1) normalizes/aliases the name first, (2) tries an exact
-    (case-insensitive) match, (3) falls back to a substring match in EITHER
-    direction — the official name inside the CSV name (e.g. "Tottenham" in
-    "Tottenham Hotspur"), or the CSV's shorter name inside the official one
-    (e.g. "Coventry" inside "Coventry City" — the direction the original
-    version of this function was missing, which is why Coventry City fell
-    all the way through to the neutral 1.0/1.0 fallback instead of using
-    their real Championship record) — but ONLY if it resolves to a SINGLE
-    unique team either way. It never silently blends two clubs' results
-    together, and returns empty (safe fallback to league-average) rather
-    than a guess when the match is ambiguous or absent in both directions.
-    """
     target = _normalize_hist_team_name(team_name)
     if not target:
         return hist_df.iloc[0:0]
@@ -284,27 +217,10 @@ def _match_hist_team_rows(hist_df: pd.DataFrame, column: str, team_name: str) ->
 def _team_hist_side_stats(team_name: str, side: str, primary_df: pd.DataFrame,
                            secondary_df: Optional[pd.DataFrame],
                            league_home_avg_g: float, league_away_avg_g: float) -> dict:
-    """
-    A team's goals-for / goals-against averages for a given side ('home' or
-    'away'), trying the top-flight dataset first. If the team has ZERO
-    matches there in the scanned window (e.g. newly promoted, no top-flight
-    history yet), falls back to the second-tier dataset with a promotion
-    adjustment — NOT a naming-mismatch case, a genuinely different source.
-    Only truly defaults to a neutral 1.0-equivalent if found in neither.
-
-    When the second-tier fallback is used, this also returns the RAW
-    (pre-adjustment) attack/defense ratios relative to the second-tier's OWN
-    average — e.g. Coventry's rating relative to the Championship average,
-    before any cross-tier translation — so the UI can show both stages of
-    the calculation transparently instead of only the final blended number.
-    """
     team_col = 'HomeTeam' if side == 'home' else 'AwayTeam'
     for_col = 'FTHG' if side == 'home' else 'FTAG'
     against_col = 'FTAG' if side == 'home' else 'FTHG'
-    # Same column -> league-average mapping used consistently for both the
-    # primary and secondary dataset, so "attack"/"defense" always mean
-    # "this column's rate, relative to this column's league average" no
-    # matter which tier of data actually produced the raw goals.
+    
     primary_avg_for = league_home_avg_g if for_col == 'FTHG' else league_away_avg_g
     primary_avg_against = league_home_avg_g if against_col == 'FTHG' else league_away_avg_g
 
@@ -343,14 +259,6 @@ def calculate_historical_lambdas(
     home_team: str, away_team: str, hist_df: pd.DataFrame,
     secondary_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[float, float, dict, dict, float, float]:
-    """Calculates team attack/defense relative strength parameters from historical data.
-    Returns (lam_home, lam_away, home_info, away_info, league_home_avg, league_away_avg).
-    home_info/away_info now also carry "attack"/"defense" ratios (relative to
-    1.00 league average) alongside the raw goals — these are exactly the α/β
-    values shown in the Team Rating Engine Controls panel, and the league_home_avg/
-    league_away_avg returned here are the SAME baseline used to compute them,
-    so an override can be recombined with `league_avg * attack * defense`
-    and get an answer consistent with the auto-computed one."""
     empty_keys = {"attack": 1.0, "defense": 1.0, "raw_attack": None, "raw_defense": None,
                   "raw_goals_for": None, "raw_goals_against": None, "goals_for": None, "goals_against": None}
     if hist_df.empty:
@@ -414,8 +322,6 @@ def _mock_squad(team: str, seed_offset: int = 0, n_games: int = 5) -> pd.DataFra
         minutes = random.randint(600, 2500)
         xg90 = round(max(0, np.random.normal(0.38 if pos == "FW" else 0.12 if pos == "MF" else 0.02, 0.10)), 3)
         xa90 = round(max(0, np.random.normal(0.22 if pos in ("FW", "MF") else 0.03, 0.08)), 3)
-        # games_rated simulates squad rotation: most starters featured in most
-        # of the last n_games, a few rotation players featured in fewer/none.
         games_rated = min(n_games, max(0, n_games - random.choice([0, 0, 0, 1, 2, n_games])))
         rating = round(np.random.normal(7.0, 0.5), 2) if games_rated > 0 else None
         key_passes90 = round(max(0, np.random.normal(1.5 if pos == "MF" else 0.6, 0.5)), 2)
@@ -546,18 +452,6 @@ def fetch_team_season_stats(league_name: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_player_recent_ratings(team_id: int, n_games: int = 5) -> dict:
-    """
-    Real per-match player ratings from the team's last n_games finished
-    fixtures (API-Football /fixtures + /fixtures/players), NOT the season
-    aggregate. This is what actually lets you see who's in form: a player's
-    season rating can be a solid 7.1 while they've been poor (or benched
-    entirely) the last 3 matches, and vice versa.
-
-    Returns {player_name: {"avg_rating": float, "games_rated": int}} where
-    games_rated is how many of the last n_games this specific player actually
-    featured in and got a rating — 0 means they've dropped out of the side
-    recently, which is itself a form signal worth showing, not hiding.
-    """
     if not API_FOOTBALL_KEY:
         return {}
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
@@ -585,8 +479,6 @@ def fetch_player_recent_ratings(team_id: int, n_games: int = 5) -> dict:
                     games = stat.get("games", {}) or {}
                     rating_raw = games.get("rating")
                     minutes = games.get("minutes")
-                    # Only count matches the player actually appeared in —
-                    # API-Football sometimes lists unused subs with no rating.
                     if name and rating_raw and minutes:
                         ratings.setdefault(name, []).append(float(rating_raw))
 
@@ -600,9 +492,6 @@ def fetch_player_recent_ratings(team_id: int, n_games: int = 5) -> dict:
 
 def _parse_players_stats_page(response_items: list, pos_map: dict, recent_ratings: dict,
                                fallback_xg90: dict, fallback_xa90: dict) -> list:
-    """Turns one page of API-Football /players response items into squad rows.
-    Shared by both the current-season and previous-season attempts below so
-    the parsing logic only exists once."""
     rows = []
     for p in response_items:
         info = p.get("player", {})
@@ -640,10 +529,6 @@ def _parse_players_stats_page(response_items: list, pos_map: dict, recent_rating
 
 
 def _fetch_players_stats_all_pages(team_id: int, season: int, headers: dict) -> list:
-    """Pages through API-Football's /players endpoint for one team+season,
-    capped at 3 pages to respect free-tier rate limits. Returns the raw
-    response items (not yet parsed into rows) so the caller can decide
-    whether the season actually had any data before committing to it."""
     items, page, total_pages = [], 1, 1
     while page <= total_pages and page <= 3:
         r_stats = requests.get(
@@ -660,28 +545,6 @@ def _fetch_players_stats_all_pages(team_id: int, season: int, headers: dict) -> 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_squad(team_name: str, seed_offset: int = 0, n_games: int = 5) -> pd.DataFrame:
-    """
-    BUGFIX: this previously made ONE call to /players?season=<current> and,
-    if it came back empty, silently fell all the way to the fake-name mock
-    squad. That endpoint is stats-driven — it only returns players who've
-    accumulated match stats for that team in that specific season — so it
-    returns empty for EVERY club during preseason (no matches played yet in
-    the new season) or for a newly promoted club with zero top-flight
-    appearances this season. Both are real, common situations, not edge
-    cases, and the old code treated them identically to "API key invalid."
-
-    Now tries three tiers before giving up, in order:
-      1. Current season's real per-player stats (best case).
-      2. Previous season's real per-player stats, if the current season has
-         no data yet (preseason, or newly promoted with zero stats so far)
-         — same players, still-useful per-90 rates, just one season stale.
-      3. The roster-only /players/squads endpoint (names + positions,
-         no season dependency at all) with position-average fallback rates,
-         if even the previous season came back empty.
-    Only falls to the fully-synthetic mock squad if the team can't be found
-    at all. Every returned DataFrame carries a "data_source" column so the
-    UI can show which tier actually produced it — no more silent fallback.
-    """
     if API_FOOTBALL_KEY:
         try:
             headers = {"x-apisports-key": API_FOOTBALL_KEY}
@@ -700,24 +563,17 @@ def fetch_squad(team_name: str, seed_offset: int = 0, n_games: int = 5) -> pd.Da
                 fallback_xg90 = {"FW": 0.30, "MF": 0.10, "DF": 0.02, "GK": 0.0}
                 fallback_xa90 = {"FW": 0.15, "MF": 0.16, "DF": 0.03, "GK": 0.0}
 
-                # Recent per-match ratings come from /fixtures?last=N, which
-                # has no "season" parameter — it just returns the last N
-                # played matches regardless of season boundary, so this
-                # tier keeps working correctly through the preseason gap.
                 recent_ratings = fetch_player_recent_ratings(team_id, n_games)
 
-                # --- Tier 1: current season stats ---
                 items = _fetch_players_stats_all_pages(team_id, season, headers)
                 data_source = f"API-Football player stats ({season} season)"
 
-                # --- Tier 2: previous season stats, if current is empty ---
                 if not items:
                     items = _fetch_players_stats_all_pages(team_id, season - 1, headers)
                     data_source = f"API-Football player stats ({season - 1} season — {season} not yet underway)"
 
                 rows = _parse_players_stats_page(items, pos_map, recent_ratings, fallback_xg90, fallback_xa90)
 
-                # --- Tier 3: roster-only endpoint, if both seasons are empty ---
                 if not rows:
                     r_squad = requests.get(
                         f"https://{API_FOOTBALL_HOST}/players/squads",
@@ -749,8 +605,6 @@ def fetch_squad(team_name: str, seed_offset: int = 0, n_games: int = 5) -> pd.Da
     df = _mock_squad(team_name, seed_offset, n_games)
     df["data_source"] = "Mock (API-Football unavailable or team not found)"
     return df
-
-
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -822,11 +676,6 @@ def fetch_market_odds(home_team: str, away_team: str, league_name: str = "Premie
 def calculate_team_base_lambdas(
     home_team: str, away_team: str, team_stats: pd.DataFrame
 ) -> Tuple[float, float, dict, dict, float, float]:
-    """Fallback lambda calculator from single-season standings data.
-    Returns the same shape as calculate_historical_lambdas — (lam_home,
-    lam_away, home_info, away_info, league_home_avg, league_away_avg) — so
-    the Team Rating Engine Controls panel works identically regardless of which
-    data source actually produced the auto values."""
     league_home_avg = max(team_stats['home_xG_for'].mean(), 1.0)
     league_away_avg = max(team_stats['away_xG_for'].mean(), 1.0)
     
@@ -837,14 +686,6 @@ def calculate_team_base_lambdas(
     away_def = (a_stat['away_xG_against'].values[0] if not a_stat.empty else 1.20) / league_home_avg
     
     away_att = (a_stat['away_xG_for'].values[0] if not a_stat.empty else 1.20) / league_away_avg
-    # BUGFIX (regression): this was dividing by league_home_avg. home_def
-    # measures a team's home defensive record, which should be benchmarked
-    # against what away teams typically score across the league — i.e.
-    # league_away_avg, the same baseline away_att uses above. Dividing by
-    # league_home_avg instead systematically mis-scaled every team's defense
-    # term, and since fetch_historical_league_data() was silently failing
-    # (see bugfix above), THIS function has been the one actually running
-    # for every single match — so this bug has been live in production.
     home_def = (h_stat['home_xG_against'].values[0] if not h_stat.empty else 1.55) / league_away_avg
     
     base_lam_home = league_home_avg * home_att * away_def
@@ -932,11 +773,14 @@ class TeamModelInputs:
     form_rating: float
     weather_mult: float
     rest_mult: float
+    xg_reg_mult: float = 1.0
+    press_mult: float = 1.0
+    travel_mult: float = 1.0
     squad_table: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     @property
     def lambda_final(self) -> float:
-        val = self.base_lambda * self.piv_multiplier * self.form_mult * self.weather_mult * self.rest_mult
+        val = self.base_lambda * self.piv_multiplier * self.form_mult * self.weather_mult * self.rest_mult * self.xg_reg_mult * self.press_mult * self.travel_mult
         return round(max(val, 0.05), 3)
 
 
@@ -948,11 +792,11 @@ def dixon_coles_tau(x: int, y: int, lam_home: float, lam_away: float, rho: float
     return 1.0
 
 
-def scoreline_matrix(lam_home: float, lam_away: float, max_goals: int = 7) -> np.ndarray:
+def scoreline_matrix(lam_home: float, lam_away: float, max_goals: int = 7, rho: float = -0.06) -> np.ndarray:
     matrix = np.zeros((max_goals + 1, max_goals + 1))
     for i in range(max_goals + 1):
         for j in range(max_goals + 1):
-            p = poisson.pmf(i, lam_home) * poisson.pmf(j, lam_away) * dixon_coles_tau(i, j, lam_home, lam_away)
+            p = poisson.pmf(i, lam_home) * poisson.pmf(j, lam_away) * dixon_coles_tau(i, j, lam_home, lam_away, rho)
             matrix[i, j] = max(p, 0)
     matrix /= matrix.sum()
     return matrix
@@ -1053,6 +897,60 @@ with c_r1:
 with c_r2:
     away_rest = st.number_input(f"{away_team}", min_value=1, max_value=14, value=7)
 
+# --- ADVANCED MODIFIERS ---
+st.sidebar.divider()
+st.sidebar.subheader("🔬 Advanced Modifiers")
+
+with st.sidebar.expander("1. xG Regression (Finishing Luck)", expanded=False):
+    st.caption("Adjusts expected goals for over/under-performing shooting efficiency.")
+    c_x1, c_x2 = st.columns(2)
+    with c_x1:
+        h_xg_c = st.number_input(f"{home_team} Created xG", value=1.50, step=0.10)
+        h_act_g = st.number_input(f"{home_team} Actual Goals", value=1.50, step=0.10)
+    with c_x2:
+        a_xg_c = st.number_input(f"{away_team} Created xG", value=1.20, step=0.10)
+        a_act_g = st.number_input(f"{away_team} Actual Goals", value=1.20, step=0.10)
+    
+    h_xg_reg_mult = ((h_xg_c * 0.70) + (h_act_g * 0.30)) / h_xg_c if h_xg_c > 0 else 1.0
+    a_xg_reg_mult = ((a_xg_c * 0.70) + (a_act_g * 0.30)) / a_xg_c if a_xg_c > 0 else 1.0
+    st.caption(f"Multiplier: Home **{h_xg_reg_mult:.2f}x** | Away **{a_xg_reg_mult:.2f}x**")
+
+with st.sidebar.expander("2. Tactical Pressing (PPDA & Tilt)", expanded=False):
+    st.caption("High-pressing teams get an attack rating boost based on Field Tilt.")
+    c_p1, c_p2 = st.columns(2)
+    with c_p1:
+        h_ppda = st.number_input(f"{home_team} PPDA", value=12.0, step=0.5)
+    with c_p2:
+        a_ppda = st.number_input(f"{away_team} PPDA", value=12.0, step=0.5)
+    
+    tilt_diff = st.number_input("Field Tilt Diff (%)", value=0.0, step=1.0, help="Positive = Home dominance, Negative = Away dominance")
+    
+    press_edge_h = a_ppda / h_ppda if h_ppda > 0 else 1.0
+    press_edge_a = h_ppda / a_ppda if a_ppda > 0 else 1.0
+    
+    h_press_mult = (1.0 + 0.05 * (press_edge_h - 1.0)) * (1.0 + tilt_diff/100 * 0.05)
+    a_press_mult = (1.0 + 0.05 * (press_edge_a - 1.0)) * (1.0 - tilt_diff/100 * 0.05)
+    st.caption(f"Multiplier: Home **{h_press_mult:.2f}x** | Away **{a_press_mult:.2f}x**")
+
+with st.sidebar.expander("3. Travel Distance & Fatigue", expanded=False):
+    st.caption("Long-distance travel decays away team expectations.")
+    away_travel_km = st.number_input("Away Travel Distance (km)", value=0.0, step=100.0)
+    away_travel_mult = max(0.90, 1.0 - (away_travel_km / 25000.0))
+    st.caption(f"Away Travel Penalty: **{away_travel_mult:.2f}x**")
+
+with st.sidebar.expander("6. Referee Strictness", expanded=False):
+    st.caption("Adjusts the Dixon-Coles ρ (low-score dependency) for red card probabilities.")
+    c_r1, c_r2 = st.columns(2)
+    with c_r1:
+        ref_cards = st.number_input("Referee Avg Cards", value=4.0, step=0.1)
+    with c_r2:
+        league_cards = st.number_input("League Avg Cards", value=4.0, step=0.1)
+        
+    ref_strictness = ref_cards / league_cards if league_cards > 0 else 1.0
+    base_rho = -0.06
+    adjusted_rho = base_rho * ref_strictness
+    st.caption(f"Strictness Ratio: **{ref_strictness:.2f}x** | Adjusted Dixon-Coles ρ: **{adjusted_rho:.3f}**")
+
 st.sidebar.divider()
 st.sidebar.subheader("Player Availability")
 rating_window = st.sidebar.slider(
@@ -1081,8 +979,6 @@ hist_df = fetch_historical_league_data(hist_code)
 secondary_code = HIST_SECONDARY_LEAGUE_MAP.get(hist_code)
 secondary_hist_df = fetch_historical_league_data(secondary_code) if secondary_code else pd.DataFrame()
 
-# Diagnostics so a repeat of the mmz4235/mmz4281 URL bug — where the historical
-# engine failed 100% silently for weeks — can never hide again. Shown in the UI below.
 lambda_source = "mock"
 home_tier_info = away_tier_info = {"tier": "n/a", "n": 0, "attack": 1.0, "defense": 1.0,
                                      "goals_for": None, "goals_against": None}
@@ -1102,15 +998,6 @@ else:
     )
     lambda_source = "live standings" if FOOTBALL_DATA_KEY else "mock season stats"
 
-# --- Team Rating Engine Controls (Automated / Custom Manual Override) ---
-# Adopts the radio-toggle UX and metric-column layout from the reference
-# snippet, but keeps OUR backend: alias-matched team lookup, per-league
-# dynamic baselines (league_home_avg_used/league_away_avg_used), and
-# auto-detected promotion handling via home_tier_info/away_tier_info — none
-# of that gets replaced. Deliberately does NOT call an LLM to estimate a
-# rating when data is missing; the neutral 1.0/1.0 fallback already in
-# home_tier_info/away_tier_info says "we don't know" honestly rather than
-# injecting an unsourced home-favorite prior.
 st.sidebar.divider()
 st.sidebar.subheader("⚙️ Team Rating Engine Controls")
 
@@ -1118,7 +1005,7 @@ rating_mode = st.sidebar.radio(
     "Rating Mode",
     options=["Automated (Data-Driven)", "Custom Manual Override"],
     index=0,
-    help="Automated uses whichever source produced the values above (historical CSV, live standings, or a labeled fallback). Custom lets you type in your own attack/defense ratings, pre-filled with the automated numbers as a starting point.",
+    help="Automated uses whichever source produced the values above. Custom lets you type in your own attack/defense ratings.",
 )
 
 def _overall_rating(attack: float, defense: float) -> float:
@@ -1145,7 +1032,7 @@ if rating_mode == "Automated (Data-Driven)":
     away_attack_eff, away_defense_eff = away_tier_info["attack"], away_tier_info["defense"]
     ratings_overridden = False
 else:
-    st.sidebar.warning("✏️ Custom override active — recombined using the same league_avg × attack × defense formula as automated mode")
+    st.sidebar.warning("✏️ Custom override active")
     c1, c2 = st.sidebar.columns(2)
     with c1:
         st.markdown(f"**{home_team}**")
@@ -1173,17 +1060,21 @@ away_piv_mult, away_squad = player_impact_score(away_squad_raw, away_active)
 home_model = TeamModelInputs(
     name=home_team, base_lambda=base_lam_home, piv_multiplier=home_piv_mult,
     form_mult=form_multiplier(home_form_df), form_rating=team_form_rating_0_100(home_form_df),
-    weather_mult=w_mult, rest_mult=rest_modifier(home_rest), squad_table=home_squad,
+    weather_mult=w_mult, rest_mult=rest_modifier(home_rest), 
+    xg_reg_mult=h_xg_reg_mult, press_mult=h_press_mult, travel_mult=1.0,
+    squad_table=home_squad,
 )
 
 away_model = TeamModelInputs(
     name=away_team, base_lambda=base_lam_away, piv_multiplier=away_piv_mult,
     form_mult=form_multiplier(away_form_df), form_rating=team_form_rating_0_100(away_form_df),
-    weather_mult=w_mult, rest_mult=rest_modifier(away_rest), squad_table=away_squad,
+    weather_mult=w_mult, rest_mult=rest_modifier(away_rest), 
+    xg_reg_mult=a_xg_reg_mult, press_mult=a_press_mult, travel_mult=away_travel_mult,
+    squad_table=away_squad,
 )
 
 lam_home, lam_away = home_model.lambda_final, away_model.lambda_final
-matrix = scoreline_matrix(lam_home, lam_away, max_goals=7)
+matrix = scoreline_matrix(lam_home, lam_away, max_goals=7, rho=adjusted_rho)
 model_probs = derive_markets(matrix)
 market_odds = fetch_market_odds(home_team, away_team, league)
 
@@ -1226,10 +1117,10 @@ st.caption(f"λ base source: **{lambda_source}**{tier_summary}")
 c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.metric("λ Home (Final xG)", lam_home)
-    st.caption(f"Base {base_lam_home} → PIV×{home_piv_mult:.2f} · Rest×{home_model.rest_mult:.2f}")
+    st.caption(f"Base {base_lam_home} → PIV×{home_piv_mult:.2f} · Rest×{home_model.rest_mult:.2f} · Reg×{h_xg_reg_mult:.2f} · Press×{h_press_mult:.2f}")
 with c2:
     st.metric("λ Away (Final xG)", lam_away)
-    st.caption(f"Base {base_lam_away} → PIV×{away_piv_mult:.2f} · Rest×{away_model.rest_mult:.2f}")
+    st.caption(f"Base {base_lam_away} → PIV×{away_piv_mult:.2f} · Rest×{away_model.rest_mult:.2f} · Reg×{a_xg_reg_mult:.2f} · Press×{a_press_mult:.2f} · Trvl×{away_travel_mult:.2f}")
 with c3:
     st.metric(f"{home_team} Form", f"{home_model.form_rating}/100")
     st.metric(f"{away_team} Form", f"{away_model.form_rating}/100")
@@ -1238,8 +1129,6 @@ with c4:
     st.metric("💨 Wind", f"{weather['wind_speed_kmh']} km/h")
 
 # ---- Rating Calculation Breakdown ----
-# A transparent, formula-level view of how α/β and λ were actually derived —
-# every number here is one we computed above, not re-estimated for display.
 with st.expander("📊 Rating Calculation Breakdown"):
     primary_league_name = league
     secondary_league_name = SECOND_TIER_DISPLAY_NAMES.get(secondary_code, secondary_code or "n/a")
@@ -1314,9 +1203,7 @@ with st.expander("📊 Rating Calculation Breakdown"):
         rf"\approx {round(league_away_avg_used * away_tier_info['attack'] * home_tier_info['defense'], 3)}\ \text{{xG}}"
     )
     st.caption(
-        "These are the BASE λ values (before PIV, form, weather, and rest multipliers are applied — see the "
-        "caption under the λ cards above for the fully adjusted figure). If you've applied a Custom Manual "
-        "Override above, this section still reflects the AUTOMATED numbers, so you can see what changed."
+        "These are the BASE λ values. Modifiers like regression, pressing tilt, rest, and travel distance are applied directly in final computation calculations."
     )
 
 st.divider()
