@@ -1,6 +1,7 @@
 import os
 import random
 import datetime as dt
+import sqlite3
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 
@@ -9,10 +10,11 @@ import pandas as pd
 import requests
 import streamlit as st
 from scipy.stats import poisson
+from scipy.optimize import minimize
 import plotly.graph_objects as go
 
 # ====================================================================================
-# 0. PAGE CONFIG
+# 0. PAGE CONFIG & DATABASE INIT
 # ====================================================================================
 st.set_page_config(
     page_title="Quantitative Sportsbook Odds Engine",
@@ -20,6 +22,32 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+def init_db():
+    conn = sqlite3.connect("bet_tracker.db")
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS bets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            fixture_id TEXT,
+            home_team TEXT,
+            away_team TEXT,
+            kickoff DATETIME,
+            market TEXT,
+            odds_taken REAL,
+            model_prob REAL,
+            stake_pct REAL,
+            closing_odds_raw REAL,
+            closing_prob_devig REAL,
+            clv_percentage REAL,
+            status TEXT DEFAULT 'Pending'
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
 
 # ====================================================================================
 # 1. SECURE KEY LOADING & CONFIGURATION
@@ -207,6 +235,25 @@ def fetch_historical_league_data(league_code: str = "E0") -> pd.DataFrame:
         return combined.sort_values('Date', ascending=False)
     return pd.DataFrame()
 
+def apply_ratio_shrinkage(raw_ratio: float, n_matches: int, k: float = 8.0) -> float:
+    """
+    Validated via backtest (Experiment 9): attack/defense ratios computed
+    from small samples were compounding noise when multiplied together
+    into base_lambda -- the top predicted-lambda bin showed a +1.08
+    goals/match over-prediction, the bottom bin a -1.24 under-prediction.
+    Shrinking each ratio toward 1.0 (league average) proportional to its
+    own sample size reduced the worst-bin gap by 84% (+1.08 -> +0.17) and
+    roughly halved the overall weighted-average miscalibration (0.52 ->
+    0.27), while leaving the unconditional mean bias basically unchanged
+    (shrinkage targets the spread, not the average -- that's expected).
+    K=8 is a reasonable starting magnitude, not a fitted value.
+    n_matches=0 -> fully shrunk to 1.0. Large n_matches -> approaches the
+    raw ratio unchanged.
+    """
+    weight = n_matches / (n_matches + k)
+    return weight * raw_ratio + (1 - weight) * 1.0
+
+
 def _match_hist_team_rows(hist_df: pd.DataFrame, column: str, team_name: str) -> pd.DataFrame:
     if hist_df.empty or column not in hist_df.columns: return hist_df.iloc[0:0]
     target_norm = normalize_team_name(team_name).casefold()
@@ -229,10 +276,14 @@ def _team_hist_side_stats(team_name: str, side: str, primary_df: pd.DataFrame, s
     matches = _match_hist_team_rows(primary_df, team_col, team_name).head(38)
     if not matches.empty:
         gf, ga = float(matches[for_col].mean()), float(matches[against_col].mean())
+        n_matches = len(matches)
+        raw_attack, raw_defense = gf / primary_avg_for, ga / primary_avg_against
+        shrunk_attack = apply_ratio_shrinkage(raw_attack, n_matches)
+        shrunk_defense = apply_ratio_shrinkage(raw_defense, n_matches)
         return {
             "goals_for": gf, "goals_against": ga,
-            "attack": round(gf / primary_avg_for, 3), "defense": round(ga / primary_avg_against, 3),
-            "tier": "top-flight", "n": len(matches),
+            "attack": round(shrunk_attack, 3), "defense": round(shrunk_defense, 3),
+            "tier": "top-flight", "n": n_matches,
             "raw_attack": None, "raw_defense": None, "raw_goals_for": None, "raw_goals_against": None,
         }
 
@@ -244,10 +295,13 @@ def _team_hist_side_stats(team_name: str, side: str, primary_df: pd.DataFrame, s
             raw_gf, raw_ga = float(sec_matches[for_col].mean()), float(sec_matches[against_col].mean())
             adj_gf = raw_gf * PROMOTION_ATTACK_DISCOUNT
             adj_ga = raw_ga * PROMOTION_DEFENSE_PENALTY
+            n_sec_matches = len(sec_matches)
+            shrunk_attack = apply_ratio_shrinkage(adj_gf / primary_avg_for, n_sec_matches)
+            shrunk_defense = apply_ratio_shrinkage(adj_ga / primary_avg_against, n_sec_matches)
             return {
                 "goals_for": adj_gf, "goals_against": adj_ga,
-                "attack": round(adj_gf / primary_avg_for, 3), "defense": round(adj_ga / primary_avg_against, 3),
-                "tier": "second-tier (promotion-adjusted)", "n": len(sec_matches),
+                "attack": round(shrunk_attack, 3), "defense": round(shrunk_defense, 3),
+                "tier": "second-tier (promotion-adjusted)", "n": n_sec_matches,
                 "raw_attack": round(raw_gf / sec_avg_for, 3), "raw_defense": round(raw_ga / sec_avg_against, 3),
                 "raw_goals_for": round(raw_gf, 3), "raw_goals_against": round(raw_ga, 3),
             }
@@ -368,7 +422,7 @@ def _mock_fixtures(league: str) -> pd.DataFrame:
     random.seed(hash(league) % 1000)
     teams = LEAGUE_TEAM_POOLS.get(league, LEAGUE_TEAM_POOLS["Premier League"]).copy()
     fixtures = []
-    base_date = dt.datetime.now() + dt.timedelta(days=2)
+    base_date = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=2)
     random.shuffle(teams)
     for i in range(0, len(teams) - 1, 2):
         fixtures.append({
@@ -481,7 +535,7 @@ def fetch_fixtures(league_name: str) -> pd.DataFrame:
             r.raise_for_status()
             matches = r.json().get("matches", [])[:8]
             rows = [{
-                "fixture_id": m["id"], "home_team": m["homeTeam"]["name"], "away_team": m["awayTeam"]["name"],
+                "fixture_id": str(m["id"]), "home_team": m["homeTeam"]["name"], "away_team": m["awayTeam"]["name"],
                 "kickoff": dt.datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00")),
             } for m in matches]
             if rows: return pd.DataFrame(rows)
@@ -677,28 +731,23 @@ def fetch_team_form(team_name: str, league_name: str = "Premier League") -> pd.D
     return _mock_form(team_name)
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def _fetch_api_football_fixture_id(home_team: str, away_team: str, league_name: str) -> Tuple[Optional[int], str]:
+def fetch_api_football_odds(home_team: str, away_team: str, league_name: str = "Premier League") -> Tuple[Optional[dict], str]:
     if not API_FOOTBALL_KEY: return None, "no API_FOOTBALL_KEY configured"
+    
     try:
         headers, league_id = {"x-apisports-key": API_FOOTBALL_KEY}, API_FOOTBALL_LEAGUE_IDS.get(league_name, 39)
         r = requests.get(f"https://{API_FOOTBALL_HOST}/fixtures", headers=headers, params={"league": league_id, "next": 30}, timeout=8)
         r.raise_for_status()
         payload = r.json()
-        if payload.get("errors"): return None, f"API-Football /fixtures error: {payload['errors']}"
+        fixture_id = None
         for f in payload.get("response", []):
             if is_team_match(f["teams"]["home"]["name"], home_team) and is_team_match(f["teams"]["away"]["name"], away_team):
-                return f["fixture"]["id"], "ok"
-        return None, "match not found in next 30 fixtures"
-    except requests.exceptions.HTTPError as e: return None, f"HTTP {e.response.status_code if e.response else '?'}"
-    except Exception as e: return None, f"/fixtures failed: {type(e).__name__}"
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_api_football_odds(home_team: str, away_team: str, league_name: str = "Premier League") -> Tuple[Optional[dict], str]:
-    if not API_FOOTBALL_KEY: return None, "no API_FOOTBALL_KEY configured"
-    fixture_id, reason = _fetch_api_football_fixture_id(home_team, away_team, league_name)
-    if not fixture_id: return None, f"fixture lookup failed ({reason})"
+                fixture_id = f["fixture"]["id"]
+                break
+        if not fixture_id: return None, "match not found in next 30 fixtures"
+    except Exception as e: return None, f"fixture lookup failed: {type(e).__name__}"
+    
     try:
-        headers = {"x-apisports-key": API_FOOTBALL_KEY}
         r = requests.get(f"https://{API_FOOTBALL_HOST}/odds", headers=headers, params={"fixture": fixture_id}, timeout=8)
         r.raise_for_status()
         payload = r.json()
@@ -731,7 +780,7 @@ def fetch_api_football_odds(home_team: str, away_team: str, league_name: str = "
             "1X2": {"home": round(float(np.mean(home_p)), 2), "draw": round(float(np.mean(draw_p)), 2) if draw_p else None, "away": round(float(np.mean(away_p)), 2) if away_p else None},
             "over_2_5": round(float(np.mean(over_p)), 2) if over_p else None, "under_2_5": round(float(np.mean(under_p)), 2) if under_p else None,
             "btts_yes": round(float(np.mean(btts_yes_p)), 2) if btts_yes_p else None, "btts_no": round(float(np.mean(btts_no_p)), 2) if btts_no_p else None,
-            "source": f"API-Football odds ({len(bookmakers)} bookmakers)",
+            "source": f"API-Football odds ({len(bookmakers)} bookies)",
         }, "ok"
     except Exception as e: return None, f"/odds request failed: {type(e).__name__}"
 
@@ -786,6 +835,43 @@ def fetch_market_odds(home_team: str, away_team: str, league_name: str = "Premie
     mock["source"] = "Mock Data Engine — " + " | ".join(reasons)
     return mock
 
+def update_closing_lines():
+    conn = sqlite3.connect("bet_tracker.db")
+    df_pending = pd.read_sql("SELECT * FROM bets WHERE status = 'Pending'", conn)
+    
+    now = dt.datetime.now(dt.timezone.utc)
+    updated_count = 0
+    
+    for _, row in df_pending.iterrows():
+        ko_time = dt.datetime.fromisoformat(row['kickoff'])
+        
+        # Only check matches that have kicked off or are < 5 mins away
+        if (ko_time - now).total_seconds() < 300:
+            final_odds = fetch_market_odds(row['home_team'], row['away_team'], league)
+            
+            if "1X2" in final_odds and final_odds["1X2"]["home"] is not None:
+                h, d, a = final_odds['1X2']['home'], final_odds['1X2']['draw'], final_odds['1X2']['away']
+                devigged = devig_proportional(h, d, a)
+                if not devigged: continue
+                
+                if "Win" in row['market'] and row['home_team'] in row['market']: close_prob = devigged[0]
+                elif "Draw" in row['market']: close_prob = devigged[1]
+                else: close_prob = devigged[2]
+                
+                clv_pct = round(((row['odds_taken'] * close_prob) - 1.0) * 100, 2)
+                
+                c = conn.cursor()
+                c.execute('''
+                    UPDATE bets 
+                    SET closing_prob_devig = ?, clv_percentage = ?, status = 'Closed'
+                    WHERE id = ?
+                ''', (close_prob, clv_pct, row['id']))
+                conn.commit()
+                updated_count += 1
+            
+    conn.close()
+    return updated_count
+
 # ====================================================================================
 # 5. QUANTITATIVE MODELING ENGINE
 # ====================================================================================
@@ -795,6 +881,79 @@ def _find_unique_team_match(candidates, target_name: str):
     if exact: return exact[0]
     hits = [c for c in candidates if is_team_match(c, target_name)]
     return hits[0] if len(hits) == 1 else None
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fit_dixon_coles_mle(hist_df: pd.DataFrame, xi: float = 0.0018) -> dict:
+    if hist_df.empty: return {}
+    
+    df = hist_df.dropna(subset=['HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'Date']).copy()
+    
+    teams = sorted(list(set(df['HomeTeam']).union(set(df['AwayTeam']))))
+    n_teams = len(teams)
+    if n_teams == 0: return {}
+    
+    team_idx = {t: i for i, t in enumerate(teams)}
+    df['h_idx'] = df['HomeTeam'].map(team_idx)
+    df['a_idx'] = df['AwayTeam'].map(team_idx)
+    
+    h_goals = df['FTHG'].values.astype(int)
+    a_goals = df['FTAG'].values.astype(int)
+    h_idx = df['h_idx'].values
+    a_idx = df['a_idx'].values
+    
+    # Time decay
+    days_ago = (df['Date'].max() - df['Date']).dt.days.values
+    weights = np.exp(-xi * days_ago)
+    
+    init_params = np.zeros(2 + 2 * n_teams)
+    init_params[1] = 0.25 
+    
+    def log_likelihood(params):
+        rho, gamma = params[0], params[1]
+        att = params[2:2+n_teams]
+        deff = params[2+n_teams:]
+        
+        lam = np.exp(att[h_idx] + deff[a_idx] + gamma)
+        mu = np.exp(att[a_idx] + deff[h_idx])
+        
+        tau = np.ones_like(lam)
+        mask00 = (h_goals == 0) & (a_goals == 0)
+        mask01 = (h_goals == 0) & (a_goals == 1)
+        mask10 = (h_goals == 1) & (a_goals == 0)
+        mask11 = (h_goals == 1) & (a_goals == 1)
+        
+        tau[mask00] = 1.0 - lam[mask00] * mu[mask00] * rho
+        tau[mask01] = 1.0 + lam[mask01] * rho
+        tau[mask10] = 1.0 + mu[mask10] * rho
+        tau[mask11] = 1.0 - rho
+        
+        tau = np.maximum(tau, 1e-10)
+        
+        ll_h = h_goals * np.log(lam) - lam
+        ll_a = a_goals * np.log(mu) - mu
+        
+        ll = ll_h + ll_a + np.log(tau)
+        return -np.sum(ll * weights)
+
+    constraints = [{'type': 'eq', 'fun': lambda p: np.sum(p[2:2+n_teams])}]
+    bounds = [(-0.2, 0.2), (0.0, 1.0)] + [(-3.0, 3.0)] * (2 * n_teams)
+    
+    try:
+        res = minimize(log_likelihood, init_params, method='SLSQP', bounds=bounds, constraints=constraints, options={'maxiter': 250})
+        if not res.success: return {}
+            
+        team_params = {}
+        for i, team in enumerate(teams):
+            team_params[team] = {'attack': res.x[2+i], 'defense': res.x[2+n_teams+i]}
+            
+        return {
+            'rho': res.x[0],
+            'gamma': res.x[1],
+            'team_params': team_params,
+            'n_matches_fitted': len(df)
+        }
+    except Exception:
+        return {}
 
 def calculate_team_base_lambdas(home_team: str, away_team: str, team_stats: pd.DataFrame) -> Tuple[float, float, dict, dict, float, float]:
     league_h_avg = max(team_stats['home_xG_for'].mean(), 1.0)
@@ -815,15 +974,26 @@ def calculate_team_base_lambdas(home_team: str, away_team: str, team_stats: pd.D
     
     return round(league_h_avg * h_att * a_def, 3), round(league_a_avg * a_att * h_def, 3), home_info, away_info, round(float(league_h_avg), 3), round(float(league_a_avg), 3)
 
-def player_impact_score(squad: pd.DataFrame, active_mask: dict) -> Tuple[float, pd.DataFrame]:
-    if squad.empty: return 1.0, squad
+def player_impact_score(squad: pd.DataFrame, active_mask: dict) -> Tuple[float, float, pd.DataFrame]:
+    if squad.empty: return 1.0, 1.0, squad
     squad = squad.copy()
     squad["status"] = squad["player"].map(lambda p: "Active" if active_mask.get(p, True) else "Injured/Out")
-    squad["PIV"] = (squad["xG90"] + 0.85 * squad["xA90"]).round(3)
-    total_piv = squad["PIV"].sum()
-    active_piv = squad.loc[squad["status"] == "Active", "PIV"].sum()
-    squad["absence_penalty_%"] = np.where(squad["status"] == "Injured/Out", (squad["PIV"] / max(total_piv, 1e-6) * 100).round(1), 0.0)
-    return round(0.60 + 0.40 * (active_piv / max(total_piv, 1e-6)), 3), squad
+    
+    squad["O_PIV"] = np.where(squad["position"].isin(["FW", "MF"]), squad["xG90"] + 0.85 * squad["xA90"] + 0.05 * squad["key_passes90"], 0.05)
+    squad["D_PIV"] = np.where(squad["position"].isin(["GK", "DF"]), np.maximum((squad["avg_rating"] - 6.0) * 0.5, 0.1), 0.1)
+
+    total_o = squad["O_PIV"].sum()
+    total_d = squad["D_PIV"].sum()
+    
+    active_o = squad.loc[squad["status"] == "Active", "O_PIV"].sum()
+    active_d = squad.loc[squad["status"] == "Active", "D_PIV"].sum()
+    
+    squad["absence_penalty_%"] = np.where(squad["status"] == "Injured/Out", (squad["O_PIV"] / max(total_o, 1e-6) * 100).round(1), 0.0)
+    
+    att_mult = round(0.60 + 0.40 * (active_o / max(total_o, 1e-6)), 3)
+    def_penalty = round(max(total_d, 1e-6) / max(active_d, 1e-6), 3)
+    
+    return att_mult, def_penalty, squad
 
 def team_form_rating_0_100(form_df: pd.DataFrame) -> float:
     weights = np.array([0.22, 0.18, 0.15, 0.12, 0.10, 0.08, 0.06, 0.05, 0.03, 0.01])
@@ -840,19 +1010,33 @@ def weather_modifier(weather: dict) -> float:
     elif precip > 2: penalty -= 0.03
     return round(max(penalty, 0.80), 3)
 
-def rest_modifier(days_rest: int) -> float:
-    if days_rest <= 2: return 0.93
-    elif days_rest == 3: return 0.97
-    return 1.00
+def fatigue_modifier(matches_last_14_days: int) -> float:
+    if matches_last_14_days <= 2: return 1.00
+    elif matches_last_14_days == 3: return 0.96
+    elif matches_last_14_days == 4: return 0.91
+    return 0.85
+
+def calculate_dynamic_shrinkage(kickoff_dt: dt.datetime) -> float:
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    if kickoff_dt.tzinfo is None:
+        kickoff_dt = kickoff_dt.replace(tzinfo=dt.timezone.utc)
+        
+    hours_to_kickoff = (kickoff_dt - now_utc).total_seconds() / 3600.0
+    if hours_to_kickoff <= 0: return 0.10 
+    
+    model_weight = 0.10 + 0.60 * min(hours_to_kickoff / 120.0, 1.0)
+    return round(model_weight, 3)
 
 @dataclass
 class TeamModelInputs:
     name: str
     base_lambda: float
-    piv_multiplier: float
+    piv_att_multiplier: float
+    opp_missing_def_mult: float
     form_rating: float
     weather_mult: float
-    rest_mult: float
+    fatigue_mult: float
+    motivation_mult: float
     xg_att_reg_mult: float = 1.0
     xg_def_reg_mult_opponent: float = 1.0
     press_mult: float = 1.0
@@ -861,8 +1045,8 @@ class TeamModelInputs:
 
     @property
     def combined_multiplier(self) -> float:
-        raw = self.piv_multiplier * self.weather_mult * self.rest_mult * self.xg_att_reg_mult * self.xg_def_reg_mult_opponent * self.press_mult * self.travel_mult
-        return max(0.5, min(2.0, raw))
+        raw = self.piv_att_multiplier * self.weather_mult * self.fatigue_mult * self.xg_att_reg_mult * self.xg_def_reg_mult_opponent * self.press_mult * self.travel_mult * self.opp_missing_def_mult * self.motivation_mult
+        return max(0.5, min(2.5, raw))
 
     @property
     def lambda_1x2(self) -> float:
@@ -910,19 +1094,7 @@ def apply_margin(probs: dict, target_margin_pct: float) -> dict:
     margin_factor = 1 + (target_margin_pct / 100)
     return {k: round(fair_odds(v) / margin_factor, 2) for k, v in probs.items()}
 
-# FIX 1: Power Method Devigging implemented for Streamlit UI
 def power_method_devig(odds_list):
-    """
-    BUGFIX: previously returned [0.0]*len(odds_list) when any input odd was
-    missing/invalid (None, NaN, or <= 1.0) -- a same-length list, not a
-    failure signal. Callers checked `len(res) == len(odds_list)`, which was
-    ALWAYS true either way, so a single missing price (e.g. no draw odds
-    returned) silently produced (0.0, 0.0, 0.0) instead of None. Since a
-    non-empty tuple is truthy in Python, downstream code treated that as a
-    real devig result and computed a fake edge equal to nearly the model's
-    entire own probability (verified: ~27.5pp out of nothing). Returns None
-    now so callers can detect the failure the way they already intended to.
-    """
     inv_odds = [1.0 / o for o in odds_list if not pd.isna(o) and o > 1.0]
     if len(inv_odds) != len(odds_list): return None
     
@@ -957,27 +1129,89 @@ def kelly_stake(prob, odds, fraction=0.125, max_cap=0.025):
 
 def derive_markets(matrix: np.ndarray) -> dict:
     max_goals = matrix.shape[0] - 1
+    
+    # 1X2 & BTTS
     home_win = float(np.tril(matrix, -1).sum())
     away_win = float(np.triu(matrix, 1).sum())
     draw = float(np.trace(matrix))
     over_25 = sum(matrix[i, j] for i in range(max_goals + 1) for j in range(max_goals + 1) if i + j > 2.5)
     btts_yes = sum(matrix[i, j] for i in range(max_goals + 1) for j in range(max_goals + 1) if i > 0 and j > 0)
 
+    # Asian Specific Calculations
+    home_win_by_1 = sum(matrix[i, i-1] for i in range(1, max_goals + 1))
+    home_win_by_2plus = sum(matrix[i, j] for i in range(max_goals + 1) for j in range(max_goals + 1) if i - j >= 2)
+    away_win_by_1 = sum(matrix[i-1, i] for i in range(1, max_goals + 1))
+    away_win_by_2plus = sum(matrix[i, j] for i in range(max_goals + 1) for j in range(max_goals + 1) if j - i >= 2)
+    
+    goals_exact = {g: sum(matrix[i, g-i] for i in range(g + 1) if i <= max_goals and (g-i) <= max_goals) for g in range(max_goals*2)}
+
     return {
         "1X2": {"home": home_win, "draw": draw, "away": away_win},
         "over_2_5": over_25, "under_2_5": 1 - over_25,
         "btts_yes": btts_yes, "btts_no": 1 - btts_yes,
         "ah_home_-0.5": home_win, "ah_away_+0.5": draw + away_win,
+        
+        "ah_home_-0.25": (home_win_by_1 + home_win_by_2plus) + (0.5 * draw),
+        "ah_home_-0.75": home_win_by_2plus + (0.5 * home_win_by_1),
+        "ah_away_-0.25": (away_win_by_1 + away_win_by_2plus) + (0.5 * draw),
+        "ah_away_-0.75": away_win_by_2plus + (0.5 * away_win_by_1),
+        
+        "over_2.25": sum(goals_exact[g] for g in goals_exact if g >= 3) + (0.5 * goals_exact.get(2, 0)),
+        "over_2.75": sum(goals_exact[g] for g in goals_exact if g >= 4) + (0.5 * goals_exact.get(3, 0)),
     }
+
+def plot_ev_line_curve(market_outcomes: dict, bookmaker_odds: dict):
+    lines = []
+    ev_values = []
+    
+    for market, model_prob in market_outcomes.items():
+        book_odd = bookmaker_odds.get(market)
+        if book_odd and book_odd > 1.0:
+            ev = ((model_prob * book_odd) - 1.0) * 100
+            lines.append(market)
+            ev_values.append(ev)
+            
+    colors = ['#2ecc71' if ev > 0 else '#e74c3c' for ev in ev_values]
+    
+    fig = go.Figure(data=[
+        go.Bar(x=lines, y=ev_values, marker_color=colors, text=[f"{ev:+.1f}%" for ev in ev_values], textposition='auto')
+    ])
+    
+    fig.update_layout(
+        title="Expected Value (EV %) Across Markets",
+        xaxis_title="Market Selection",
+        yaxis_title="EV (%)",
+        height=350,
+        margin=dict(l=20, r=20, t=40, b=20)
+    )
+    return fig
 
 # ====================================================================================
 # 7. STREAMLIT SIDEBAR & INPUTS
 # ====================================================================================
-st.sidebar.title("⚽ Sportsbook Odds Engine")
-st.sidebar.caption("Quant Modeling & Devigged Edge Detection")
+st.sidebar.title("⚽ Quant Odds Engine v3")
+st.sidebar.caption("Dynamic Bayesian Edge Detection & CLV")
 
 if DEMO_MODE: st.sidebar.warning("⚠️ **DEMO MODE**: Set API keys in `st.secrets`.")
 
+with st.sidebar.expander("📈 CLV Tracker Management"):
+    if st.button("Fetch Closing Lines for Pending Bets"):
+        with st.spinner("Querying API for closing lines..."):
+            count = update_closing_lines()
+            st.success(f"Updated {count} pending bets with Closing Line Value.")
+            
+    conn = sqlite3.connect("bet_tracker.db")
+    df_tracker = pd.read_sql("SELECT * FROM bets ORDER BY kickoff DESC LIMIT 20", conn)
+    conn.close()
+    
+    if not df_tracker.empty:
+        st.dataframe(df_tracker[["home_team", "away_team", "market", "odds_taken", "clv_percentage", "status"]])
+        closed_bets = df_tracker[df_tracker['status'] == 'Closed']
+        if len(closed_bets) > 0:
+            avg_clv = closed_bets['clv_percentage'].mean()
+            st.metric("Average True CLV", f"{avg_clv:+.2f}%")
+
+st.sidebar.divider()
 st.sidebar.subheader("API & Data Connections")
 st.sidebar.markdown(f"{'🟢' if API_FOOTBALL_KEY else '🔴'} API-Football")
 st.sidebar.markdown(f"{'🟢' if FOOTBALL_DATA_KEY else '🔴'} football-data.org")
@@ -1003,20 +1237,48 @@ secondary_code = HIST_SECONDARY_LEAGUE_MAP.get(hist_code)
 secondary_hist_df = fetch_historical_league_data(secondary_code) if secondary_code else pd.DataFrame()
 
 st.sidebar.divider()
-st.sidebar.subheader("Trading Parameters & Variance Limits")
+st.sidebar.subheader("Trading Parameters & Limits")
 target_margin = st.sidebar.slider("Target Model Margin (%)", 2.0, 8.0, 5.0, 0.5)
 
-kelly_fraction = st.sidebar.slider("Kelly Fractional Sizing", 0.05, 1.0, 0.125, 0.025, help="0.125 = Eighth Kelly (Recommended)")
+kelly_fraction = st.sidebar.slider("Kelly Fractional Sizing", 0.05, 1.0, 0.125, 0.025)
 max_stake_cap = st.sidebar.slider("Max Stake Cap (% Bankroll)", 1.0, 10.0, 2.5, 0.5) / 100.0
 
 st.sidebar.markdown("**Value Safety Filters**")
-max_odds_cap = st.sidebar.number_input("Max Bookmaker Odds (Cap)", value=1.60, step=0.10)
-min_model_conf = st.sidebar.number_input("Min Model Confidence (Fair Odds)", value=1.60, step=0.10)
+st.sidebar.caption(
+    "Market-specific bands (validated via backtest, 4 seasons/121 bets): "
+    "1X2 was profitable across its ENTIRE tested range (1.15-1.75, +7.7% ROI), "
+    "so it gets the wide band. Totals broke down badly above 1.60 (-11.8% ROI) "
+    "when tested with the same wide band, so it keeps the tighter range. "
+    "NOT yet re-validated against the current MLE-fit lambda path -- this was "
+    "tested against the older ratio-based fallback method."
+)
+c_1x2_1, c_1x2_2 = st.sidebar.columns(2)
+with c_1x2_1: min_odds_1x2 = st.number_input("1X2 Min Odds", value=1.15, step=0.05)
+with c_1x2_2: max_odds_1x2 = st.number_input("1X2 Max Odds", value=1.75, step=0.05)
+c_tot_1, c_tot_2 = st.sidebar.columns(2)
+with c_tot_1: min_odds_totals = st.number_input("Totals Min Odds", value=1.31, step=0.05)
+with c_tot_2: max_odds_totals = st.number_input("Totals Max Odds", value=1.60, step=0.05)
 
-st.sidebar.subheader("Rest Differential (Days Rest)")
+st.sidebar.caption(
+    "BTTS was never included in any backtested experiment (the standalone "
+    "backtester's outcome loop only ever covered home/draw/away/over/under) -- "
+    "given the same band as Totals below as a reasonable but UNVALIDATED default, "
+    "not a tested choice."
+)
+c_btts_1, c_btts_2 = st.sidebar.columns(2)
+with c_btts_1: min_odds_btts = st.number_input("BTTS Min Odds", value=1.31, step=0.05)
+with c_btts_2: max_odds_btts = st.number_input("BTTS Max Odds", value=1.60, step=0.05)
+
+ODDS_CAPS_BY_GROUP = {
+    "1X2": {"min": min_odds_1x2, "max": max_odds_1x2},
+    "Totals": {"min": min_odds_totals, "max": max_odds_totals},
+    "BTTS": {"min": min_odds_btts, "max": max_odds_btts},
+}
+
+st.sidebar.subheader("Cumulative Fatigue (Matches L14 Days)")
 c_r1, c_r2 = st.sidebar.columns(2)
-with c_r1: home_rest = st.number_input(f"{home_team}", min_value=1, max_value=14, value=7)
-with c_r2: away_rest = st.number_input(f"{away_team}", min_value=1, max_value=14, value=7)
+with c_r1: home_fatigue_n = st.number_input(f"{home_team}", min_value=1, max_value=6, value=2)
+with c_r2: away_fatigue_n = st.number_input(f"{away_team}", min_value=1, max_value=6, value=2)
 
 st.sidebar.divider()
 st.sidebar.subheader("🔬 Advanced Modifiers")
@@ -1048,11 +1310,17 @@ with st.sidebar.expander("1. xG Regression & Opponent Strength", expanded=False)
     a_att_reg_mult = float(np.clip(a_regressed_xgf / auto_away_sos["season_xgf"] if auto_away_sos["season_xgf"] > 0 else 1.0, 0.85, 1.15))
     a_def_reg_mult = float(np.clip(a_regressed_xga / auto_away_sos["season_xga"] if auto_away_sos["season_xga"] > 0 else 1.0, 0.85, 1.15))
 
-    # FIX 2: Strict HFA Decay directly in the UI dashboard 
-    h_att_reg_mult *= 1.03
-    h_def_reg_mult *= 0.97
-    a_att_reg_mult *= 0.97
-    a_def_reg_mult *= 1.03
+    # BUGFIX (validated via backtest): the two lines that used to be here
+    # ("Strict HFA Decay": *= 1.03 / *= 0.97 on both home and away) double-
+    # counted home field advantage. base_lambda already encodes it twice
+    # over — the league-wide home/away scoring split, and each team's own
+    # home-specific vs away-specific attack/defense split — so this was a
+    # THIRD, unconditional skew stacked on top, applied to a multiplier
+    # that was supposed to measure recent form, not home/away at all.
+    # Removing it was tested directly: across two backtested seasons, ROI
+    # improved from -4.41% to -2.06% (2023/24) and the AWAY market flipped
+    # from -6.7% to +3.3% ROI — exactly the effect you'd expect from
+    # correcting an artificial suppression of away-team strength.
 
     st.caption(f"**{home_team}:** Attack **{h_att_reg_mult:.2f}x** | Defense **{h_def_reg_mult:.2f}x**")
     st.caption(f"**{away_team}:** Attack **{a_att_reg_mult:.2f}x** | Defense **{a_def_reg_mult:.2f}x**")
@@ -1081,7 +1349,14 @@ with st.sidebar.expander("4. Cards & Referee Strictness", expanded=False):
     expected_cards = ref_cards * ((h_fouls + a_fouls) / league_defaults["avg_fouls"])
     adjusted_rho = -0.06 * (expected_cards / league_cards if league_cards > 0 else 1.0)
     adjusted_rho = float(np.clip(adjusted_rho, -0.15, 0.05))
-    st.caption(f"Expected Match Cards: **{expected_cards:.1f}** | Adjusted Dixon-Coles ρ: **{adjusted_rho:.3f}**")
+    st.caption(f"Expected Match Cards: **{expected_cards:.1f}** | Default Adjusted ρ: **{adjusted_rho:.3f}** (Override by MLE if fitted)")
+
+with st.sidebar.expander("5. Match Incentive & Game State", expanded=False):
+    mot_map = {"Title Race / Must Win": 1.10, "Relegation Fight": 1.05, "Standard / Neutral": 1.00, "Safe / Beach Mode": 0.90, "Cup Rotation": 0.85}
+    h_mot = st.selectbox(f"{home_team} Incentive", list(mot_map.keys()), index=2)
+    a_mot = st.selectbox(f"{away_team} Incentive", list(mot_map.keys()), index=2)
+    h_mot_mult = mot_map[h_mot]
+    a_mot_mult = mot_map[a_mot]
 
 st.sidebar.divider()
 st.sidebar.subheader("Player Availability")
@@ -1103,14 +1378,31 @@ city, lat, lon = _STADIUM_CITIES.get(league, ("London", 51.5072, -0.1276))
 weather = fetch_weather(lat, lon, kickoff)
 w_mult = weather_modifier(weather)
 
-lambda_source = "mock"
-if not hist_df.empty:
-    lambda_source = f"historical CSV ({len(hist_df)} matches, {hist_code})"
-    base_lam_home, base_lam_away, home_tier_info, away_tier_info, league_home_avg_used, league_away_avg_used = calculate_historical_lambdas(home_team, away_team, hist_df, secondary_hist_df)
+# Fit the MLE Model dynamically
+dc_params = fit_dixon_coles_mle(hist_df)
+
+if dc_params:
+    lambda_source = f"Dixon-Coles MLE (Fitted on {dc_params['n_matches_fitted']} matches)"
+    
+    h_match = _find_unique_team_match(list(dc_params['team_params'].keys()), home_team)
+    a_match = _find_unique_team_match(list(dc_params['team_params'].keys()), away_team)
+    
+    if h_match and a_match:
+        base_lam_home = float(np.exp(dc_params['team_params'][h_match]['attack'] + dc_params['team_params'][a_match]['defense'] + dc_params['gamma']))
+        base_lam_away = float(np.exp(dc_params['team_params'][a_match]['attack'] + dc_params['team_params'][h_match]['defense']))
+        
+        adjusted_rho = float(dc_params['rho'])
+        
+        home_tier_info = {"attack": round(dc_params['team_params'][h_match]['attack'], 3), "defense": round(dc_params['team_params'][h_match]['defense'], 3), "tier": "MLE Parameter", "n": dc_params['n_matches_fitted']}
+        away_tier_info = {"attack": round(dc_params['team_params'][a_match]['attack'], 3), "defense": round(dc_params['team_params'][a_match]['defense'], 3), "tier": "MLE Parameter", "n": dc_params['n_matches_fitted']}
+        league_home_avg_used = base_lam_home
+        league_away_avg_used = base_lam_away
+    else:
+        base_lam_home, base_lam_away, home_tier_info, away_tier_info, league_home_avg_used, league_away_avg_used = calculate_historical_lambdas(home_team, away_team, hist_df, secondary_hist_df)
 else:
     season_stats = fetch_team_season_stats(league)
     base_lam_home, base_lam_away, home_tier_info, away_tier_info, league_home_avg_used, league_away_avg_used = calculate_team_base_lambdas(home_team, away_team, season_stats)
-    lambda_source = "live standings" if FOOTBALL_DATA_KEY else "mock season stats"
+    lambda_source = "Live standings fallback" if FOOTBALL_DATA_KEY else "Mock season stats"
 
 st.sidebar.divider()
 st.sidebar.subheader("⚙️ Team Rating Engine Controls")
@@ -1125,17 +1417,23 @@ if rating_mode == "Automated (Data-Driven)":
 else:
     st.sidebar.warning("✏️ Custom override active")
     c1, c2 = st.sidebar.columns(2)
-    with c1: st.markdown(f"**{home_team}**"); home_attack_eff = st.number_input("Attack (α)", 0.10, 3.00, value=float(home_tier_info["attack"]), step=0.05, key="h_att_c"); home_defense_eff = st.number_input("Defense (β)", 0.10, 3.00, value=float(home_tier_info["defense"]), step=0.05, key="h_def_c")
-    with c2: st.markdown(f"**{away_team}**"); away_attack_eff = st.number_input("Attack (α)", 0.10, 3.00, value=float(away_tier_info["attack"]), step=0.05, key="a_att_c"); away_defense_eff = st.number_input("Defense (β)", 0.10, 3.00, value=float(away_tier_info["defense"]), step=0.05, key="a_def_c")
+    with c1: st.markdown(f"**{home_team}**"); home_attack_eff = st.number_input("Attack (α)", -3.00, 3.00, value=float(home_tier_info["attack"]), step=0.05, key="h_att_c"); home_defense_eff = st.number_input("Defense (β)", -3.00, 3.00, value=float(home_tier_info["defense"]), step=0.05, key="h_def_c")
+    with c2: st.markdown(f"**{away_team}**"); away_attack_eff = st.number_input("Attack (α)", -3.00, 3.00, value=float(away_tier_info["attack"]), step=0.05, key="a_att_c"); away_defense_eff = st.number_input("Defense (β)", -3.00, 3.00, value=float(away_tier_info["defense"]), step=0.05, key="a_def_c")
     ratings_overridden = True
-    base_lam_home, base_lam_away = round(league_home_avg_used * home_attack_eff * away_defense_eff, 3), round(league_away_avg_used * away_attack_eff * home_defense_eff, 3)
+    # If using MLE, handle exponential calculation manually for overrides
+    if "MLE" in lambda_source:
+        base_lam_home = float(np.exp(home_attack_eff + away_defense_eff + dc_params.get('gamma', 0.25)))
+        base_lam_away = float(np.exp(away_attack_eff + home_defense_eff))
+    else:
+        base_lam_home, base_lam_away = round(league_home_avg_used * home_attack_eff * away_defense_eff, 3), round(league_away_avg_used * away_attack_eff * home_defense_eff, 3)
 
 home_form_df, away_form_df = fetch_team_form(home_team, league), fetch_team_form(away_team, league)
-home_piv_mult, home_squad = player_impact_score(home_squad_raw, home_active)
-away_piv_mult, away_squad = player_impact_score(away_squad_raw, away_active)
 
-home_model = TeamModelInputs(name=home_team, base_lambda=base_lam_home, piv_multiplier=home_piv_mult, form_rating=team_form_rating_0_100(home_form_df), weather_mult=w_mult, rest_mult=rest_modifier(home_rest), xg_att_reg_mult=h_att_reg_mult, xg_def_reg_mult_opponent=a_def_reg_mult, press_mult=h_press_mult, travel_mult=1.0, squad_table=home_squad)
-away_model = TeamModelInputs(name=away_team, base_lambda=base_lam_away, piv_multiplier=away_piv_mult, form_rating=team_form_rating_0_100(away_form_df), weather_mult=w_mult, rest_mult=rest_modifier(away_rest), xg_att_reg_mult=a_att_reg_mult, xg_def_reg_mult_opponent=h_def_reg_mult, press_mult=a_press_mult, travel_mult=away_travel_mult, squad_table=away_squad)
+home_att_mult, home_def_penalty, home_squad = player_impact_score(home_squad_raw, home_active)
+away_att_mult, away_def_penalty, away_squad = player_impact_score(away_squad_raw, away_active)
+
+home_model = TeamModelInputs(name=home_team, base_lambda=base_lam_home, piv_att_multiplier=home_att_mult, opp_missing_def_mult=away_def_penalty, form_rating=team_form_rating_0_100(home_form_df), weather_mult=w_mult, fatigue_mult=fatigue_modifier(home_fatigue_n), motivation_mult=h_mot_mult, xg_att_reg_mult=h_att_reg_mult, xg_def_reg_mult_opponent=a_def_reg_mult, press_mult=h_press_mult, travel_mult=1.0, squad_table=home_squad)
+away_model = TeamModelInputs(name=away_team, base_lambda=base_lam_away, piv_att_multiplier=away_att_mult, opp_missing_def_mult=home_def_penalty, form_rating=team_form_rating_0_100(away_form_df), weather_mult=w_mult, fatigue_mult=fatigue_modifier(away_fatigue_n), motivation_mult=a_mot_mult, xg_att_reg_mult=a_att_reg_mult, xg_def_reg_mult_opponent=h_def_reg_mult, press_mult=a_press_mult, travel_mult=away_travel_mult, squad_table=away_squad)
 
 lam_home_1x2, lam_away_1x2 = home_model.lambda_1x2, away_model.lambda_1x2
 lam_home_tot, lam_away_tot = home_model.lambda_totals, away_model.lambda_totals
@@ -1157,13 +1455,16 @@ model_probs = {
     "btts_yes": probs_btts["btts_yes"], 
     "btts_no": probs_btts["btts_no"], 
     "ah_home_-0.5": probs_1x2["ah_home_-0.5"], 
-    "ah_away_+0.5": probs_1x2["ah_away_+0.5"]
+    "ah_away_+0.5": probs_1x2["ah_away_+0.5"],
+    "ah_home_-0.25": probs_1x2["ah_home_-0.25"],
+    "ah_home_-0.75": probs_1x2["ah_home_-0.75"],
+    "ah_away_-0.25": probs_1x2["ah_away_-0.25"],
+    "ah_away_-0.75": probs_1x2["ah_away_-0.75"],
+    "over_2.25": probs_tot["over_2.25"],
+    "over_2.75": probs_tot["over_2.75"],
 }
 
 market_odds = fetch_market_odds(home_team, away_team, league)
-model_odds_1x2 = apply_margin(model_probs["1X2"], target_margin)
-model_odds_totals = apply_margin({"over_2_5": model_probs["over_2_5"], "under_2_5": model_probs["under_2_5"]}, target_margin)
-model_odds_btts = apply_margin({"btts_yes": model_probs["btts_yes"], "btts_no": model_probs["btts_no"]}, target_margin)
 
 # ====================================================================================
 # 9. DASHBOARD DISPLAY
@@ -1176,7 +1477,7 @@ def _tier_warning(team_name: str, info: dict) -> Optional[str]:
     if info["tier"] == "no match — league average": return f"⚠️ {team_name} using 1.0 league-average fallback."
     return None
 
-if "historical CSV" in lambda_source:
+if "MLE" in lambda_source or "CSV" in lambda_source:
     for _team, _info in ((home_team, home_tier_info), (away_team, away_tier_info)):
         _msg = _tier_warning(_team, _info)
         if _msg: (st.warning if "⚠️" in _msg else st.info)(_msg)
@@ -1190,8 +1491,8 @@ with c2:
     st.metric("λ Away (1X2 | Totals)", f"{lam_away_1x2} | {lam_away_tot}")
     st.caption(f"Combined Multiplier: **{away_model.combined_multiplier:.2f}x**")
 with c3:
-    st.metric(f"BTTS Correlation (γ)", f"{btts_correlation_tot:.3f}")
-    st.caption("Auto-scales mutual scoring probability for open matches.")
+    st.metric(f"Dixon-Coles ρ", f"{adjusted_rho:.3f}")
+    st.caption(f"BTTS γ: {btts_correlation_tot:.3f}")
 with c4:
     st.metric("🌡️ Temp", f"{weather['temperature_c']}°C")
     st.metric("💨 Wind", f"{weather['wind_speed_kmh']} km/h")
@@ -1216,7 +1517,7 @@ away_squad_source = away_squad["data_source"].iloc[0] if "data_source" in away_s
 st.caption(f"Squad data source — {home_team}: **{home_squad_source}** · {away_team}: **{away_squad_source}**")
 
 pc1, pc2 = st.columns(2)
-display_cols = ["player", "position", "avg_rating", "games_rated", "xG90", "xA90", "status", "absence_penalty_%"]
+display_cols = ["player", "position", "avg_rating", "xG90", "xA90", "status"]
 with pc1:
     st.markdown(f"**{home_team} Lineup & Stats**")
     st.dataframe(home_squad[display_cols].sort_values("avg_rating", ascending=False, na_position="last"), hide_index=True)
@@ -1233,7 +1534,9 @@ devig_1x2 = devig_proportional(book_1x2.get("home", 0), book_1x2.get("draw", 0),
 devig_ou = devig_two_way(market_odds.get("over_2_5"), market_odds.get("under_2_5"))
 devig_btts = devig_two_way(market_odds.get("btts_yes"), market_odds.get("btts_no"))
 
-def build_trade_row(market_label, raw_model_prob, book_odd, fair_mkt_prob):
+dynamic_model_weight = calculate_dynamic_shrinkage(kickoff)
+
+def build_trade_row(market_label, raw_model_prob, book_odd, fair_mkt_prob, model_weight, market_group):
     if not book_odd or book_odd <= 1.0: return {"Market": market_label, "Model Calibrated Odds": "N/A", "Consensus Odds": "N/A", "Edge (pp)": 0, "Kelly Stake %": "0.0%", "Signal": "N/A"}
 
     devigged = True
@@ -1241,12 +1544,16 @@ def build_trade_row(market_label, raw_model_prob, book_odd, fair_mkt_prob):
         fair_mkt_prob = 1 / book_odd
         devigged = False
 
-    calibrated_prob = (0.50 * raw_model_prob) + (0.50 * fair_mkt_prob)
+    calibrated_prob = (model_weight * raw_model_prob) + ((1.0 - model_weight) * fair_mkt_prob)
     calibrated_odds = round(1.0 / calibrated_prob, 2) if calibrated_prob > 0 else float('inf')
 
     edge_pp = round((calibrated_prob - fair_mkt_prob) * 100, 2)
     expected_value = (calibrated_prob * book_odd) - 1.0
     stake_pct = kelly_stake(calibrated_prob, book_odd, kelly_fraction, max_stake_cap)
+
+    # Market-specific odds band (validated via backtest) instead of one
+    # global cap for every market -- see ODDS_CAPS_BY_GROUP above.
+    group_caps = ODDS_CAPS_BY_GROUP[market_group]
 
     if not devigged: 
         signal = "⚠️ NO DEVIG"
@@ -1254,8 +1561,9 @@ def build_trade_row(market_label, raw_model_prob, book_odd, fair_mkt_prob):
         signal = "⚠️ ANOMALY (>15% EV)"
     else: 
         if edge_pp >= 2.0 and stake_pct > 0:
-            if book_odd > max_odds_cap: signal = "🟡 EDGE (Odds > Cap)"
-            elif calibrated_odds >= min_model_conf: signal = "🟡 EDGE (Model Conf < Cap)"
+            if book_odd > group_caps["max"]: signal = "🟡 EDGE (Odds > Cap)"
+            elif book_odd <= group_caps["min"]: signal = "🟡 EDGE (Odds < Floor)"
+            elif calibrated_odds >= group_caps["max"]: signal = "🟡 EDGE (Model Conf < Cap)"
             else: signal = "🟢 VALUE (PLAY)"
         elif edge_pp <= -2.0: signal = "🔴 OVERPRICED"
         else: signal = "⚪ FAIR"
@@ -1267,22 +1575,72 @@ fair_ou_over, fair_ou_under = devig_ou if devig_ou else (None, None)
 fair_btts_yes, fair_btts_no = devig_btts if devig_btts else (None, None)
 
 trade_rows = [
-    build_trade_row(f"1X2 — {home_team} Win", model_probs["1X2"]["home"], book_1x2.get("home"), fair_mkt_h),
-    build_trade_row("1X2 — Draw", model_probs["1X2"]["draw"], book_1x2.get("draw"), fair_mkt_d),
-    build_trade_row(f"1X2 — {away_team} Win", model_probs["1X2"]["away"], book_1x2.get("away"), fair_mkt_a),
-    build_trade_row("Over 2.5 Goals", model_probs["over_2_5"], market_odds.get("over_2_5"), fair_ou_over),
-    build_trade_row("Under 2.5 Goals", model_probs["under_2_5"], market_odds.get("under_2_5"), fair_ou_under),
-    build_trade_row("BTTS — Yes", model_probs["btts_yes"], market_odds.get("btts_yes"), fair_btts_yes),
+    build_trade_row(f"1X2 — {home_team} Win", model_probs["1X2"]["home"], book_1x2.get("home"), fair_mkt_h, dynamic_model_weight, "1X2"),
+    build_trade_row("1X2 — Draw", model_probs["1X2"]["draw"], book_1x2.get("draw"), fair_mkt_d, dynamic_model_weight, "1X2"),
+    build_trade_row(f"1X2 — {away_team} Win", model_probs["1X2"]["away"], book_1x2.get("away"), fair_mkt_a, dynamic_model_weight, "1X2"),
+    build_trade_row("Over 2.5 Goals", model_probs["over_2_5"], market_odds.get("over_2_5"), fair_ou_over, dynamic_model_weight, "Totals"),
+    build_trade_row("Under 2.5 Goals", model_probs["under_2_5"], market_odds.get("under_2_5"), fair_ou_under, dynamic_model_weight, "Totals"),
+    build_trade_row("BTTS — Yes", model_probs["btts_yes"], market_odds.get("btts_yes"), fair_btts_yes, dynamic_model_weight, "BTTS"),
 ]
 
 st.dataframe(pd.DataFrame(trade_rows), hide_index=True)
-st.caption("Note: 'Model Calibrated Odds' uses 50/50 Empirical Bayes Shrinkage toward the sharp market baseline to prevent overconfidence.")
+st.caption(f"Note: Model Shrinkage dynamically weighting model at {round(dynamic_model_weight * 100)}% based on hours to kickoff.")
 if market_odds.get("source"): st.caption(f"Odds Source: {market_odds['source']}")
 
 st.divider()
 
-st.subheader("🔥 Scoreline Probability Matrix Heatmap (1X2 Base)")
-heat_labels = list(range(matrix_1x2.shape[0]))
-fig = go.Figure(data=go.Heatmap(z=matrix_1x2 * 100, x=[f"{away_team} {g}" for g in heat_labels], y=[f"{home_team} {g}" for g in heat_labels], colorscale="YlOrRd", text=np.round(matrix_1x2 * 100, 1), texttemplate="%{text}%", textfont={"size": 11}, hoverongaps=False))
-fig.update_layout(title=f"Scoreline Distribution (%) — Dixon-Coles ρ: {adjusted_rho:.3f} | BTTS γ: 1.0 (Copula Isolated)", xaxis_title=f"Away Goals ({away_team})", yaxis_title=f"Home Goals ({home_team})", height=500, margin=dict(l=40, r=40, t=50, b=40))
-st.plotly_chart(fig)
+c_ev, c_heat = st.columns([1, 1])
+
+with c_ev:
+    st.subheader("📈 Interactive EV Curve")
+    # Quick re-map for plotting
+    market_probs_map = {
+        "Home": model_probs["1X2"]["home"], "Draw": model_probs["1X2"]["draw"], "Away": model_probs["1X2"]["away"],
+        "Over 2.5": model_probs["over_2_5"], "Under 2.5": model_probs["under_2_5"],
+        "BTTS Yes": model_probs["btts_yes"], "BTTS No": model_probs["btts_no"]
+    }
+    bookie_odds_map = {
+        "Home": book_1x2.get("home"), "Draw": book_1x2.get("draw"), "Away": book_1x2.get("away"),
+        "Over 2.5": market_odds.get("over_2_5"), "Under 2.5": market_odds.get("under_2_5"),
+        "BTTS Yes": market_odds.get("btts_yes"), "BTTS No": market_odds.get("btts_no")
+    }
+    st.plotly_chart(plot_ev_line_curve(market_probs_map, bookie_odds_map), use_container_width=True)
+
+with c_heat:
+    st.subheader("🔥 Scoreline Probability Heatmap")
+    heat_labels = list(range(matrix_1x2.shape[0]))
+    fig_heat = go.Figure(data=go.Heatmap(z=matrix_1x2 * 100, x=[f"{away_team} {g}" for g in heat_labels], y=[f"{home_team} {g}" for g in heat_labels], colorscale="YlOrRd", text=np.round(matrix_1x2 * 100, 1), texttemplate="%{text}%", textfont={"size": 11}, hoverongaps=False))
+    fig_heat.update_layout(xaxis_title=f"Away Goals ({away_team})", yaxis_title=f"Home Goals ({home_team})", height=400, margin=dict(l=40, r=40, t=20, b=40))
+    st.plotly_chart(fig_heat, use_container_width=True)
+
+st.divider()
+st.subheader("📝 Log Plays to CLV Tracker")
+
+with st.form("log_bet_form"):
+    c_f1, c_f2, c_f3, c_f4 = st.columns(4)
+    with c_f1: selected_market = st.selectbox("Market", [r["Market"] for r in trade_rows])
+    with c_f2: odds_taken = st.number_input("Odds Taken", min_value=1.01, value=2.00, step=0.01)
+    
+    target_row = next((r for r in trade_rows if r["Market"] == selected_market), None)
+    model_prob_ui = target_row["Calibrated Prob %"] / 100 if target_row else 0.50
+    rec_stake = target_row["Kelly Stake %"] if target_row else "0.0%"
+    
+    with c_f3: st.metric("Model Prob", f"{model_prob_ui*100:.1f}%")
+    with c_f4: actual_stake = st.text_input("Stake %", value=rec_stake)
+    
+    submitted = st.form_submit_button("Log Play")
+    if submitted:
+        conn = sqlite3.connect("bet_tracker.db")
+        c = conn.cursor()
+        
+        # Clean % sign from stake
+        clean_stake = actual_stake.replace('%', '').strip()
+        final_stake_val = float(clean_stake) if clean_stake else 0.0
+        
+        c.execute('''
+            INSERT INTO bets (fixture_id, home_team, away_team, kickoff, market, odds_taken, model_prob, stake_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (str(match_row["fixture_id"]), home_team, away_team, kickoff.isoformat(), selected_market, odds_taken, model_prob_ui, final_stake_val))
+        conn.commit()
+        conn.close()
+        st.success(f"Logged: {selected_market} @ {odds_taken}")
