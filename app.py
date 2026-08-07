@@ -31,6 +31,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             fixture_id TEXT,
+            league TEXT,
             home_team TEXT,
             away_team TEXT,
             kickoff DATETIME,
@@ -236,23 +237,8 @@ def fetch_historical_league_data(league_code: str = "E0") -> pd.DataFrame:
     return pd.DataFrame()
 
 def apply_ratio_shrinkage(raw_ratio: float, n_matches: int, k: float = 8.0) -> float:
-    """
-    Validated via backtest (Experiment 9): attack/defense ratios computed
-    from small samples were compounding noise when multiplied together
-    into base_lambda -- the top predicted-lambda bin showed a +1.08
-    goals/match over-prediction, the bottom bin a -1.24 under-prediction.
-    Shrinking each ratio toward 1.0 (league average) proportional to its
-    own sample size reduced the worst-bin gap by 84% (+1.08 -> +0.17) and
-    roughly halved the overall weighted-average miscalibration (0.52 ->
-    0.27), while leaving the unconditional mean bias basically unchanged
-    (shrinkage targets the spread, not the average -- that's expected).
-    K=8 is a reasonable starting magnitude, not a fitted value.
-    n_matches=0 -> fully shrunk to 1.0. Large n_matches -> approaches the
-    raw ratio unchanged.
-    """
     weight = n_matches / (n_matches + k)
     return weight * raw_ratio + (1 - weight) * 1.0
-
 
 def _match_hist_team_rows(hist_df: pd.DataFrame, column: str, team_name: str) -> pd.DataFrame:
     if hist_df.empty or column not in hist_df.columns: return hist_df.iloc[0:0]
@@ -843,11 +829,13 @@ def update_closing_lines():
     updated_count = 0
     
     for _, row in df_pending.iterrows():
-        ko_time = dt.datetime.fromisoformat(row['kickoff'])
+        ko_time = pd.to_datetime(row['kickoff'], utc=True)
         
         # Only check matches that have kicked off or are < 5 mins away
         if (ko_time - now).total_seconds() < 300:
-            final_odds = fetch_market_odds(row['home_team'], row['away_team'], league)
+            # Explicitly pass the bet's saved league, preventing cross-league corruption
+            bet_league = row['league'] if 'league' in row and pd.notna(row['league']) else "Premier League"
+            final_odds = fetch_market_odds(row['home_team'], row['away_team'], bet_league)
             
             if "1X2" in final_odds and final_odds["1X2"]["home"] is not None:
                 h, d, a = final_odds['1X2']['home'], final_odds['1X2']['draw'], final_odds['1X2']['away']
@@ -883,7 +871,7 @@ def _find_unique_team_match(candidates, target_name: str):
     return hits[0] if len(hits) == 1 else None
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fit_dixon_coles_mle(hist_df: pd.DataFrame, xi: float = 0.0018) -> dict:
+def fit_dixon_coles_mle(hist_df: pd.DataFrame, xi: float = 0.0018, l2_reg: float = 0.05) -> dict:
     if hist_df.empty: return {}
     
     df = hist_df.dropna(subset=['HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'Date']).copy()
@@ -933,7 +921,11 @@ def fit_dixon_coles_mle(hist_df: pd.DataFrame, xi: float = 0.0018) -> dict:
         ll_a = a_goals * np.log(mu) - mu
         
         ll = ll_h + ll_a + np.log(tau)
-        return -np.sum(ll * weights)
+        
+        # Add L2 penalty on attack and defense parameters to prevent overfitting
+        ridge_penalty = l2_reg * (np.sum(att**2) + np.sum(deff**2))
+        
+        return -np.sum(ll * weights) + ridge_penalty
 
     constraints = [{'type': 'eq', 'fun': lambda p: np.sum(p[2:2+n_teams])}]
     bounds = [(-0.2, 0.2), (0.0, 1.0)] + [(-3.0, 3.0)] * (2 * n_teams)
@@ -1054,8 +1046,9 @@ class TeamModelInputs:
 
     @property
     def lambda_totals(self) -> float:
-        gamma = 0.50
-        return round(max(self.base_lambda * (1.0 + gamma * (self.combined_multiplier - 1.0)), 0.05), 3)
+        # Fixed: Removed the dampening equation (gamma = 0.5) that previously
+        # pulled down high multipliers and artificially compressed variance.
+        return self.lambda_1x2
 
 def dixon_coles_tau(x: int, y: int, lam_home: float, lam_away: float, rho: float = -0.06) -> float:
     if x == 0 and y == 0: return 1 - lam_home * lam_away * rho
@@ -1309,18 +1302,6 @@ with st.sidebar.expander("1. xG Regression & Opponent Strength", expanded=False)
     h_def_reg_mult = float(np.clip(h_regressed_xga / auto_home_sos["season_xga"] if auto_home_sos["season_xga"] > 0 else 1.0, 0.85, 1.15))
     a_att_reg_mult = float(np.clip(a_regressed_xgf / auto_away_sos["season_xgf"] if auto_away_sos["season_xgf"] > 0 else 1.0, 0.85, 1.15))
     a_def_reg_mult = float(np.clip(a_regressed_xga / auto_away_sos["season_xga"] if auto_away_sos["season_xga"] > 0 else 1.0, 0.85, 1.15))
-
-    # BUGFIX (validated via backtest): the two lines that used to be here
-    # ("Strict HFA Decay": *= 1.03 / *= 0.97 on both home and away) double-
-    # counted home field advantage. base_lambda already encodes it twice
-    # over — the league-wide home/away scoring split, and each team's own
-    # home-specific vs away-specific attack/defense split — so this was a
-    # THIRD, unconditional skew stacked on top, applied to a multiplier
-    # that was supposed to measure recent form, not home/away at all.
-    # Removing it was tested directly: across two backtested seasons, ROI
-    # improved from -4.41% to -2.06% (2023/24) and the AWAY market flipped
-    # from -6.7% to +3.3% ROI — exactly the effect you'd expect from
-    # correcting an artificial suppression of away-team strength.
 
     st.caption(f"**{home_team}:** Attack **{h_att_reg_mult:.2f}x** | Defense **{h_def_reg_mult:.2f}x**")
     st.caption(f"**{away_team}:** Attack **{a_att_reg_mult:.2f}x** | Defense **{a_def_reg_mult:.2f}x**")
@@ -1581,6 +1562,16 @@ trade_rows = [
     build_trade_row("Over 2.5 Goals", model_probs["over_2_5"], market_odds.get("over_2_5"), fair_ou_over, dynamic_model_weight, "Totals"),
     build_trade_row("Under 2.5 Goals", model_probs["under_2_5"], market_odds.get("under_2_5"), fair_ou_under, dynamic_model_weight, "Totals"),
     build_trade_row("BTTS — Yes", model_probs["btts_yes"], market_odds.get("btts_yes"), fair_btts_yes, dynamic_model_weight, "BTTS"),
+    
+    # Exposing the derived Asian Markets to the UI. Since The Odds API logic currently fetches h2h,totals 
+    # and safely devigs standard lines, these Asian lines will default to N/A bookie odds, allowing 
+    # users to manually evaluate model probabilities vs their own sportsbook feeds without breaking the UI.
+    build_trade_row(f"AH {home_team} -0.25", model_probs["ah_home_-0.25"], None, None, dynamic_model_weight, "1X2"),
+    build_trade_row(f"AH {home_team} -0.75", model_probs["ah_home_-0.75"], None, None, dynamic_model_weight, "1X2"),
+    build_trade_row(f"AH {away_team} -0.25", model_probs["ah_away_-0.25"], None, None, dynamic_model_weight, "1X2"),
+    build_trade_row(f"AH {away_team} -0.75", model_probs["ah_away_-0.75"], None, None, dynamic_model_weight, "1X2"),
+    build_trade_row("Over 2.25 Goals", model_probs["over_2.25"], None, None, dynamic_model_weight, "Totals"),
+    build_trade_row("Over 2.75 Goals", model_probs["over_2.75"], None, None, dynamic_model_weight, "Totals"),
 ]
 
 st.dataframe(pd.DataFrame(trade_rows), hide_index=True)
@@ -1638,9 +1629,9 @@ with st.form("log_bet_form"):
         final_stake_val = float(clean_stake) if clean_stake else 0.0
         
         c.execute('''
-            INSERT INTO bets (fixture_id, home_team, away_team, kickoff, market, odds_taken, model_prob, stake_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (str(match_row["fixture_id"]), home_team, away_team, kickoff.isoformat(), selected_market, odds_taken, model_prob_ui, final_stake_val))
+            INSERT INTO bets (fixture_id, league, home_team, away_team, kickoff, market, odds_taken, model_prob, stake_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (str(match_row["fixture_id"]), league, home_team, away_team, kickoff.isoformat(), selected_market, odds_taken, model_prob_ui, final_stake_val))
         conn.commit()
         conn.close()
         st.success(f"Logged: {selected_market} @ {odds_taken}")
